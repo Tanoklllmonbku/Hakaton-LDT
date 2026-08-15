@@ -1,39 +1,47 @@
 # Helpful commands for DP
+
 ## Table of contents
 
 1. [Git](#git)
 2. [Python](#python)
 
-### Git
+## Git
 
-1. clone: 
+1. clone:
 ```bash
-git clone <repo_name> 
-(Without .git!!!)
+git clone <repo_name>
+# Without .git!!!
 ```
 
 2. merge:
 ```bash
 #If u got some changes:
 git stash
-#After all ops:
-git stash pop #For getting current unsaved head
-#in main or any other branch
+
 #Create branch
-git branch <branch_name>
-git switch <branch_name>
-#or
 git switch -c <branch_name>
+
 #Pop stash if u got changes!
+git stash pop
+
 #Actions...
+git add <files>
 git commit -m '...'
 git push -u origin <branch_name>
-#Go to main
-git checkout test
+
+#Go to test
+git switch test
+git pull
+
 #Merge
 git merge <branch_name>
-#Push
 git push -u origin test
+
+#If test`s is OK - merge test to main
+git switch main
+git pull
+git merge test
+git push -u origin main
 ```
 
 3. Work process:
@@ -48,4 +56,5 @@ git switch -c <branch_name>
 #Use understandable branch names:
 # test/<type of change>/<changes area>/<changes essence>
 ```
-### Python
+
+## Python
