@@ -1,5 +1,3 @@
-<<<<<<< Updated upstream
-=======
 # 15.08.2026
 Changes:
 1. Added new documents for architecture
@@ -60,4 +58,3 @@ Plans for 20-21.08.2026:
         Проверить порядок колонок в индексе outbox_pending_idx. Рекомендуется (status, available_at, created_at) для оптимальной работы с SKIP LOCKED.
     Identity Context:
         Добавить пометку, что UserRepository реализован как порт, что позволит в будущем заменить in-process реализацию на gRPC-клиент без изменения Domain-слоя.
->>>>>>> Stashed changes
