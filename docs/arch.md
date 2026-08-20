@@ -8,7 +8,7 @@
 2. [Поток обработки документа](#поток-обработки-документа)
 3. [Структура frontend](#структура-frontend-fsd-architecture)
 4. [Структура backend](#структура-backend-ddd-architecture)
-5. [Структура шины событий](#структура-шины-событий)
+5. [Структура шины событий](#структура-шины-событий-kafka)
 6. [Структура воркеров](#структура-воркеров)
 7. [Структура хранилищ](#структура-хранилищ)
 8. [Структура системы оркестрации](#структура-системы-оркестрации)
@@ -16,6 +16,8 @@
 ---
 
 ## Общая архитектура компонентов
+
+> **Ключевое архитектурное решение этой версии:** `doc.matching.requested` публикуется **только одним владельцем** — Context Worker'ом, синхронно (в одной транзакции) с сохранением своего результата, через Outbox. Saga Orchestrator **больше не дублирует** эту публикацию в happy path. Роль Saga сужена и чётко определена: **обнаружение сбоев и таймаутов** шагов OCR/Context и запуск компенсации. Это устраняет гонку двух источников истины за один и тот же INSERT.
 
 ```mermaid
 graph TB
@@ -31,7 +33,8 @@ graph TB
         OUTBOX_TBL[(Outbox Table<br>в той же транзакции)]
         OUTBOX_RELAY[Outbox Relay<br>SKIP LOCKED claim]
         PROD[Kafka Producer]
-        SAGA[Saga Orchestrator<br>Consumer + Coordinator]
+        SAGA[Saga Orchestrator<br>Failure/Timeout Detector]
+        TIMEOUT[Timeout Scanner<br>периодический job]
         NOTIFY[Notification Relay<br>Kafka → WebSocket]
     end
 
@@ -45,6 +48,9 @@ graph TB
         K7[voice.transcribe.requested]
         K8[voice.transcribe.completed]
         K9[file.upload.completed]
+        K10[task.compensation.requested]
+        DLQ1[doc.ocr.dlq]
+        DLQ2[doc.context.dlq]
     end
 
     subgraph Workers["⚙️ Сервисы"]
@@ -52,10 +58,11 @@ graph TB
         CTX[Context-воркеры<br>Python]
         MATCH[Matching-воркеры<br>Python]
         VOICE[Voice Transcribe<br>воркеры Python]
+        COMP[Compensation Worker<br>Python]
     end
 
     subgraph Storage["💾 ХРАНИЛИЩА"]
-        PG[(PostgreSQL<br>результаты, протоколы, outbox, saga_state)]
+        PG[(PostgreSQL<br>результаты, протоколы, outbox,<br>task_processing_steps)]
         MINIO[(MinIO<br>документы, чертежи, аудио)]
         REDIS[(Redis<br>кэш, быстрая координация)]
     end
@@ -72,14 +79,13 @@ graph TB
     FS -->|метаданные| PG
 
     %% Outbox pattern: команда пишет агрегат + событие в одной транзакции
-    CMD -->|INSERT агрегат + событие,<br>одна транзакция| PG
+    CMD -->|INSERT агрегат + событие<br>+ task_processing_steps,<br>одна транзакция| PG
     PG -->|хранит| OUTBOX_TBL
     OUTBOX_TBL -->|читает pending с SKIP LOCKED| OUTBOX_RELAY
     OUTBOX_RELAY --> PROD
 
-    %% Публикация начальных событий (только *.requested)
+    %% Публикация начальных событий
     PROD --> K1 & K7
-    %% Context публикуется ТОЛЬКО после OCR
 
     %% Потоки воркеров
     K1 --> OCR
@@ -90,27 +96,40 @@ graph TB
     CTX --> PG & MINIO
     VOICE --> PG & MINIO
 
-    %% OCR → Context через Outbox
-    OCR -->|в транзакции: результат + outbox doc.context.requested| PG
+    %% OCR → Context (единственный триггер) через Outbox
+    OCR -->|транзакция: результат + outbox doc.context.requested<br>+ UPDATE task_processing_steps| PG
     PG --> OUTBOX_TBL --> OUTBOX_RELAY --> PROD --> K2
 
-    %% Completion события от воркеров
+    %% Completion события от воркеров (для Notify и для Saga-мониторинга)
     OCR -->|публикация| K4
     CTX -->|публикация| K5
     VOICE -->|публикация| K8
 
-    %% Saga Orchestrator — Consumer + PostgreSQL durable state
-    K4 --> SAGA
-    K5 --> SAGA
-    SAGA -->|запись состояния + команда в PG| PG
-    PG -->|task_processing_steps + saga_commands + outbox| OUTBOX_TBL
-    OUTBOX_TBL --> OUTBOX_RELAY --> PROD --> K3
-
+    %% Context → Matching (ЕДИНСТВЕННЫЙ триггер) через Outbox
+    CTX -->|транзакция: результат + outbox doc.matching.requested<br>+ UPDATE task_processing_steps| PG
+    PG --> OUTBOX_TBL --> OUTBOX_RELAY --> PROD --> K3
     K3 --> MATCH
 
     %% Matching поток
     MATCH --> PG & MINIO
     MATCH -->|публикация| K6
+
+    %% Saga — ТОЛЬКО отслеживание состояния + обнаружение сбоев
+    K4 -.->|отслеживание состояния| SAGA
+    K5 -.->|отслеживание состояния| SAGA
+    DLQ1 -->|сбой шага| SAGA
+    DLQ2 -->|сбой шага| SAGA
+    TIMEOUT -->|таймаут шага| SAGA
+    SAGA -->|запись состояния| PG
+    SAGA <-->|быстрый кэш состояния| REDIS
+    OCR -.->|при исчерпании retry| DLQ1
+    CTX -.->|при исчерпании retry| DLQ2
+
+    %% Компенсация
+    SAGA -->|FailTaskUseCase → outbox| PG
+    PG --> OUTBOX_TBL --> OUTBOX_RELAY --> PROD --> K10
+    K10 --> COMP
+    COMP -->|очистка временных файлов| MINIO
 
     %% Уведомления клиента в реальном времени
     K4 --> NOTIFY
@@ -122,14 +141,12 @@ graph TB
     %% File Upload триггер
     K9 -->|триггер| K1
 
-    %% Redis — только кэш/координация
-    SAGA <-->|быстрый кэш состояния| REDIS
-
     %% Оркестрация
     K8s -.->|Deployment/HPA| GW
-    K8s -.->|Deployment/HPA| OCR & CTX & MATCH & VOICE
+    K8s -.->|Deployment/HPA| OCR & CTX & MATCH & VOICE & COMP
     K8s -.->|Deployment, несколько реплик<br>с SKIP LOCKED| OUTBOX_RELAY
-    K8s -.->|Kafka cluster/partitions| K1 & K2 & K3 & K4 & K5 & K6 & K7 & K8 & K9
+    K8s -.->|CronJob| TIMEOUT
+    K8s -.->|Kafka cluster/partitions| K1 & K2 & K3 & K4 & K5 & K6 & K7 & K8 & K9 & K10
     K8s -.->|StatefulSet/replicas| PG
     K8s -.->|StatefulSet/replicas| MINIO
     K8s -.->|Sentinel/cluster| REDIS
@@ -137,9 +154,11 @@ graph TB
     classDef gateway fill:#4dabf7,stroke:#1971c2,color:#fff
     classDef saga fill:#ffd43b,stroke:#e67700
     classDef outbox fill:#e599f7,stroke:#9c36b5,color:#fff
+    classDef dlq fill:#fa5252,stroke:#c92a2a,color:#fff
     class GW,FS,CMD,PROD gateway
-    class SAGA,NOTIFY saga
+    class SAGA,NOTIFY,TIMEOUT saga
     class OUTBOX_TBL,OUTBOX_RELAY outbox
+    class DLQ1,DLQ2 dlq
 ```
 
 ### Описание схемы компонентов
@@ -168,8 +187,9 @@ graph TB
 - **Валидация** — проверка входных данных (структура, типы, обязательные поля)
 - **Роутинг задач** — маршрутизация запросов к соответствующим обработчикам
 - **Outbox Relay** — отдельный процесс/под, читающий `outbox_events` с использованием `SELECT FOR UPDATE SKIP LOCKED` для атомарного claim'а записей; публикует их в Kafka
-- **Saga Orchestrator** — координация распределённых процессов (слушает `doc.ocr.completed` / `doc.context.completed`, записывает durable-состояние и команды в PostgreSQL, запускает Matching через Outbox)
-- **Notification Relay** — транслирует completion-события (`*.completed`) в WebSocket для клиента; независим от Saga и не влияет на бизнес-логику координации
+- **Saga Orchestrator** — **только обнаружение сбоев и таймаутов**: слушает `doc.ocr.dlq`, `doc.context.dlq`, а также сигналы от Timeout Scanner; happy path (запуск Matching) через Saga **не проходит**
+- **Timeout Scanner** — периодический job (CronJob), сканирующий `task_processing_steps` на предмет "зависших" шагов
+- **Notification Relay** — транслирует completion-события (`*.completed`) в WebSocket для клиента; независим от Saga
 
 **Технические детали:**
 - Реализован на **Go** для высокой производительности и низкой задержки
@@ -189,22 +209,25 @@ graph TB
 |-------|------------|----------|----------|
 | `doc.ocr.requested` | Запрос на OCR | Outbox Relay | OCR Worker |
 | `doc.context.requested` | Запрос на Context | Outbox Relay (после OCR) | Context Worker |
-| `doc.matching.requested` | Запрос на Matching | Outbox Relay (через saga_commands) | Matching Worker |
+| `doc.matching.requested` | Запрос на Matching | **Outbox Relay — либо от Context Worker (если Context нужен), либо от OCR Worker напрямую (если Context не нужен для task_type); ровно один producer на конкретную задачу** | Matching Worker |
 | `voice.transcribe.requested` | Запрос на транскрибацию | Outbox Relay | Voice Worker |
-| `doc.ocr.completed` | OCR завершён | OCR Worker | Saga, Notification Relay |
-| `doc.context.completed` | Context завершён | Context Worker | Saga, Notification Relay |
+| `doc.ocr.completed` | OCR завершён | OCR Worker | Saga (мониторинг состояния), Notification Relay |
+| `doc.context.completed` | Context завершён | Context Worker | Saga (мониторинг состояния), Notification Relay |
 | `doc.matching.completed` | Matching завершён | Matching Worker | Notification Relay |
 | `voice.transcribe.completed` | Транскрибация завершена | Voice Worker | Notification Relay |
+| `doc.ocr.dlq` | OCR исчерпал попытки | OCR Worker | **Saga (детектор сбоя)** |
+| `doc.context.dlq` | Context исчерпал попытки | Context Worker | **Saga (детектор сбоя)** |
+| `task.compensation.requested` | Задача провалена, нужна очистка | Outbox Relay (из FailTaskUseCase) | Compensation Worker |
 | `file.upload.completed` | Файл загружен | File Service | — (триггер) |
 
-> **Важно:** `doc.matching.completed` и `voice.transcribe.completed` **не потребляются Saga** — Saga гейтит только запуск Matching, для которого нужны исключительно `doc.ocr.completed` и `doc.context.completed`. Оба события идут напрямую в Notification Relay для доставки клиенту в реальном времени.
+> **Важно:** `doc.matching.requested` публикуется **строго один раз** — Context Worker'ом, в той же транзакции, где сохраняется его результат. Saga этот топик не публикует. Saga потребляет `doc.ocr.completed` / `doc.context.completed` **только для отслеживания состояния** (нужно для работы Timeout Scanner — знать, какие шаги ещё не завершились), а не для принятия решения о запуске Matching. Единственный путь, которым Saga инициирует действие — это `doc.ocr.dlq` / `doc.context.dlq` (немедленный сбой) или срабатывание Timeout Scanner (сбой по таймауту без явного события).
 
 **Преимущества использования:**
 - Асинхронная обработка длительных задач (OCR, CV, сопоставление, транскрибация)
 - Слабая связанность сервисов
 - Возможность репликации и отказоустойчивости
 - Масштабирование через **кластер Kafka** и увеличение количества партиций
-- **Saga-координация** через completion-события
+- Чёткое разделение happy path (прямой outbox-чейнинг воркер → воркер) и failure path (Saga)
 
 ---
 
@@ -218,13 +241,45 @@ graph TB
 - Извлечение таблиц и текстовых блоков
 - Векторизация графических элементов на чертежах (CV)
 - **Публикация `doc.ocr.completed`** после завершения
-- **Создание `doc.context.requested` в Outbox** в той же транзакции (если Context требуется)
+- **Ветвление триггера следующего шага** (см. ниже) в той же транзакции, где сохраняется результат
+- **Обновление `task_processing_steps`** (status='completed', step='ocr') в той же транзакции
 
 **Технологии:** Python, ML-модели (Tesseract, EasyOCR, OpenCV)
+
+**Обработка при завершении (единая PostgreSQL-транзакция):**
+
+```text
+BEGIN;
+  INSERT consumed_events (consumer_name='ocr-worker', event_id=:event_id)
+  INSERT ocr_results (task_id, ...)
+  UPDATE task_processing_steps SET status='completed', completed_at=now()
+      WHERE task_id=:task_id AND step='ocr'
+
+  IF context_is_needed THEN
+      INSERT outbox_events (doc.context.requested)
+      -- следующий шаг триггерит Context Worker
+  ELSE
+      INSERT outbox_events (doc.matching.requested)
+      -- OCR сам становится единственным триггером Matching для этого task_type
+      UPDATE task_processing_steps
+      SET status = 'skipped', completed_at = now()
+      WHERE task_id = :task_id AND step = 'context'
+      -- 'skipped', а не 'completed': шаг не выполнялся, а был неприменим для
+      -- данного task_type. Это не даёт Timeout Scanner'у ложно сработать по
+      -- отсутствующему шагу 'context' и одновременно не искажает аналитику
+      -- по фактически обработанным Context-задачам ('completed' ≠ 'skipped')
+  END IF
+COMMIT;
+-- ack Kafka message только после COMMIT
+```
+
+Если `INSERT outbox_events` (или любой другой шаг) упадёт, вся транзакция откатывается целиком, сообщение Kafka не подтверждается (`ack`), и OCR-воркер безопасно повторит обработку при следующей доставке — благодаря `ON CONFLICT DO NOTHING` в `consumed_events` повторный `INSERT ocr_results` не создаст дубликат, если часть шагов уже успела закоммититься в предыдущей (частично успешной) попытке.
 
 **Идемпотентность:**
 - Запись в `consumed_events` с `event_id`
 - Уникальный индекс `(task_id, processing_version)` на результатах
+
+**При исчерпании ретраев (3 попытки):** сообщение публикуется в `doc.ocr.dlq` — это единственный сигнал, по которому Saga узнаёт о немедленном сбое шага OCR.
 
 ---
 
@@ -234,13 +289,17 @@ graph TB
 - Привязка сущностей к разделам и страницам
 - Извлечение контекстной информации (номера чертежей, спецификации, размеры)
 - **Публикация `doc.context.completed`** после завершения
-- **Создание `saga_commands` + `doc.matching.requested` в Outbox** в той же транзакции
+- **Создание `doc.matching.requested` в Outbox** в той же транзакции — **единственный владелец этого триггера** во всей системе
+- **Обновление `task_processing_steps`** (status='completed') в той же транзакции
 
 **Технологии:** Python, NER-модели, обработка естественного языка
 
 **Идемпотентность:**
 - Запись в `consumed_events` с `event_id`
 - Уникальный индекс `(task_id, processing_version)` на результатах
+- `saga_commands` содержит `UNIQUE(task_id, command_type)` как последний рубеж защиты от повторной публикации при ретрае самого Context Worker'а
+
+**При исчерпании ретраев (3 попытки):** сообщение публикуется в `doc.context.dlq` — сигнал для Saga.
 
 ---
 
@@ -257,6 +316,19 @@ graph TB
 - Запись в `consumed_events` с `event_id`
 - Уникальный индекс `(task_id, processing_version)` на расхождениях
 
+**Обработка сбоя (терминальный шаг — Saga НЕ участвует):** Matching — последний шаг цепочки, поэтому в отличие от OCR/Context его сбой не требует внешнего наблюдателя (Saga отвечает только за `doc.ocr.dlq` / `doc.context.dlq`, см. раздел Saga Orchestrator). При исчерпании 3 попыток Matching Worker **сам, в одной транзакции**, перед публикацией в `doc.matching.dlq`:
+
+```text
+BEGIN;
+  UPDATE task SET status = 'failed_with_partial_results'
+      WHERE task_id = :task_id
+  INSERT outbox_events (task.compensation.requested, reason='matching_failed')
+COMMIT;
+publish doc.matching.dlq  -- для мониторинга/алертинга, не как триггер действия
+```
+
+Таким образом `doc.matching.dlq` остаётся источником только для операционного мониторинга (алерт в Prometheus, см. Retry & DLQ политика), а не входом ещё одного consumer'а Saga — это сохраняет принцип "Saga знает только про OCR и Context".
+
 ---
 
 #### 4.4 Voice Transcribe-воркеры
@@ -269,11 +341,24 @@ graph TB
 
 **Технологии:** Python, Speech-to-Text модели (Whisper, Vosk, или облачные API)
 
-> **Архитектурная особенность:** Voice Transcribe — **независимый параллельный процесс**, не входящий в цепочку OCR → Context → Matching. Его завершение не гейтит запуск Matching и не является частью saga-состояния для сопоставления документов. Результат транскрипции доставляется клиенту через Notification Relay сразу по готовности и присоединяется к протоколу/задаче асинхронно.
+> **Архитектурная особенность:** Voice Transcribe — **независимый параллельный процесс**, не входящий в цепочку OCR → Context → Matching. Его завершение не гейтит запуск Matching и не отслеживается Saga вообще (ни в happy path, ни в failure path). Результат транскрипции доставляется клиенту через Notification Relay сразу по готовности.
 
 **Идемпотентность:**
 - Запись в `consumed_events` с `event_id`
 - Уникальный индекс `(task_id, voice_id)` на результатах
+
+---
+
+#### 4.5 Compensation Worker
+**Назначение:**
+- Подписан на `task.compensation.requested`
+- Удаляет временные/черновые артефакты из MinIO для проваленной задачи
+- **Не удаляет** уже сохранённые валидные частичные результаты (OCR/Context) — они остаются для возможного ручного или автоматического ретрая
+- Логирует факт очистки
+
+**Технологии:** Python
+
+**Идемпотентность удаления в MinIO:** DELETE-операция сама по себе не идемпотентна "по умолчанию" — если воркер успел удалить файлы, но упал до commit'а в PostgreSQL или до ack в Kafka, при повторной обработке того же сообщения он попытается удалить уже отсутствующие объекты. Адаптер MinIO должен трактовать ответ `404 Not Found` (`NoSuchKey`) от S3-совместимого API как **успешное завершение** операции удаления, а не как ошибку — это делает саму операцию удаления идемпотентной и исключает ложные алерты/бесконечные ретраи при повторной доставке.
 
 ---
 
@@ -287,8 +372,8 @@ graph TB
 - Хранение транскрибированных текстов голосовых заметок
 - Журналирование действий инспекторов
 - **Outbox-таблица** для атомарной публикации событий
-- **Durable-состояние Saga** (`task_processing_steps`)
-- **Команды Saga** (`saga_commands`)
+- **Состояние шагов обработки** (`task_processing_steps`) — используется Timeout Scanner'ом, а не для гейтинга Matching
+- **Команды Saga** (`saga_commands`) — теперь фиксирует только компенсирующие команды, а не `doc.matching.requested`
 - **Идемпотентность consumer'ов** (`consumed_events`)
 
 **Масштабирование:** StatefulSet с репликами (read replicas для аналитики)
@@ -309,7 +394,7 @@ graph TB
 
 #### 5.3 Redis
 **Назначение:**
-- **Быстрый runtime state и coordination layer** для Saga (кэш состояния)
+- **Быстрый runtime state и coordination layer** для Saga (кэш состояния шагов — для UI-прогресса и для Timeout Scanner)
 - **Не является источником истины** — все финальные решения принимаются на основе PostgreSQL
 - При потере Redis состояние восстанавливается из PostgreSQL
 - Кэширование часто запрашиваемых данных
@@ -329,10 +414,12 @@ graph TB
 |-----------|-------------|--------------------------|
 | **API Gateway (HTTP + Saga + Notify)** | Deployment | HPA по CPU/RPS |
 | **Outbox Relay** | Deployment | **Несколько реплик с SKIP LOCKED** (обеспечивает HA) |
+| **Timeout Scanner** | CronJob | Периодический запуск (например, каждую 1 минуту) |
 | **OCR-воркеры** | Deployment | HPA/KEDA по длине очереди Kafka |
 | **Context-воркеры** | Deployment | HPA/KEDA по длине очереди Kafka |
 | **Matching-воркеры** | Deployment | HPA/KEDA по длине очереди Kafka |
 | **Voice Transcribe-воркеры** | Deployment | HPA/KEDA по длине очереди Kafka |
+| **Compensation Worker** | Deployment | HPA/KEDA по длине очереди Kafka |
 | **Kafka** | StatefulSet | Кластер + партиции |
 | **PostgreSQL** | StatefulSet | Реплики (primary + read replicas) |
 | **MinIO** | StatefulSet | Распределённый режим (erasure coding) |
@@ -356,7 +443,8 @@ sequenceDiagram
     participant MATCH as Matching Worker
     participant VOICE as Voice Transcribe Worker
     participant SAGA as Saga Orchestrator
-    participant REDIS as Redis
+    participant TS as Timeout Scanner
+    participant COMP as Compensation Worker
     participant NOTIFY as Notification Relay
 
     Note over FE,K: 1. СОЗДАНИЕ ЗАДАЧИ (ФАЗА 1: create)
@@ -399,9 +487,9 @@ sequenceDiagram
     GW->>GW: Определить какие события нужны
     Note over GW: зависит от task_type и process
 
-    GW->>PG: Транзакция:<br>UPDATE task status='processing'<br>+ INSERT task_processing_steps (expected_steps)<br>+ INSERT outbox_events (doc.ocr.requested)<br>+ INSERT outbox_events (voice.transcribe.requested если включён)
+    GW->>PG: Транзакция:<br>UPDATE task status='processing'<br>+ INSERT task_processing_steps (ожидаемые шаги: ocr, context — для Timeout Scanner)<br>+ INSERT outbox_events (doc.ocr.requested)<br>+ INSERT outbox_events (voice.transcribe.requested если включён)
 
-    Note over GW: Context НЕ публикуется здесь!<br>Context будет создан OCR-воркером
+    Note over GW: Context и Matching НЕ публикуются здесь!<br>Каждый следующий шаг триггерит предыдущий воркер
 
     Note over OR,K: 5. OUTBOX RELAY ПУБЛИКУЕТ СОБЫТИЯ
 
@@ -412,7 +500,7 @@ sequenceDiagram
         OR->>PG: UPDATE status='published'
     end
 
-    Note over K,VOICE: 6. ОБРАБОТКА ВОРКЕРАМИ
+    Note over K,VOICE: 6. ОБРАБОТКА ВОРКЕРАМИ (ЦЕПОЧКА ЧЕРЕЗ OUTBOX)
 
     K->>OCR: doc.ocr.requested
     OCR->>OCR: Проверка идемпотентности (consumed_events)
@@ -420,17 +508,27 @@ sequenceDiagram
     M-->>OCR: файл
     OCR->>OCR: OCR обработка
 
-    OCR->>PG: Транзакция:<br>+ INSERT consumed_events (ocr-worker, event_id)<br>+ INSERT ocr_results (task_id)<br>+ INSERT outbox_events (doc.context.requested) если context нужен<br>+ INSERT outbox_events (doc.matching.requested) если context не нужен<br>+ COMMIT
+    alt Успех
+        OCR->>PG: Транзакция:<br>+ INSERT consumed_events (ocr-worker, event_id)<br>+ INSERT ocr_results (task_id)<br>+ UPDATE task_processing_steps SET status='completed' WHERE step='ocr'<br>+ INSERT outbox_events (doc.context.requested) если context нужен<br>+ COMMIT
+        OCR->>K: doc.ocr.completed
+    else Ошибка после 3 попыток
+        OCR->>K: doc.ocr.dlq
+        Note over OCR,K: Единственный сигнал немедленного сбоя для Saga
+    end
 
-    OCR->>K: doc.ocr.completed
-
-    alt Context нужен
+    alt Context нужен и OCR успешен
         K->>CTX: doc.context.requested
         CTX->>CTX: Проверка идемпотентности (consumed_events)
         CTX->>PG: Чтение OCR результатов
         CTX->>CTX: Context обработка
-        CTX->>PG: Транзакция:<br>+ INSERT consumed_events (context-worker, event_id)<br>+ INSERT context_results (task_id)<br>+ INSERT saga_commands (doc.matching.requested)<br>+ INSERT outbox_events (doc.matching.requested)<br>+ COMMIT
-        CTX->>K: doc.context.completed
+
+        alt Успех
+            CTX->>PG: Транзакция:<br>+ INSERT consumed_events (context-worker, event_id)<br>+ INSERT context_results (task_id)<br>+ UPDATE task_processing_steps SET status='completed' WHERE step='context'<br>+ INSERT saga_commands (matching_trigger) ON CONFLICT DO NOTHING<br>+ INSERT outbox_events (doc.matching.requested)<br>+ COMMIT
+            Note over CTX,PG: Context Worker — ЕДИНСТВЕННЫЙ владелец<br>триггера doc.matching.requested
+            CTX->>K: doc.context.completed
+        else Ошибка после 3 попыток
+            CTX->>K: doc.context.dlq
+        end
     end
 
     K->>VOICE: voice.transcribe.requested
@@ -440,28 +538,40 @@ sequenceDiagram
     VOICE->>VOICE: Транскрибация речи
     VOICE->>PG: Транзакция:<br>+ INSERT consumed_events<br>+ INSERT voice_results<br>+ COMMIT
     VOICE->>K: voice.transcribe.completed
-    Note over VOICE,K: Voice — независимый параллельный процесс,<br>НЕ входит в saga-гейт для Matching
+    Note over VOICE,K: Voice — независимый процесс,<br>НЕ отслеживается Saga вообще
 
-    Note over SAGA,PG: 7. SAGA-КООРДИНАЦИЯ (через PostgreSQL)
+    Note over SAGA,TS: 7. SAGA — ТОЛЬКО МОНИТОРИНГ И ОБНАРУЖЕНИЕ СБОЕВ
 
-    K->>SAGA: doc.ocr.completed
-    SAGA->>PG: UPDATE task_processing_steps SET status='completed'
+    K->>SAGA: doc.ocr.completed (мониторинг)
+    SAGA->>PG: (информационно) сверка с task_processing_steps
+    K->>SAGA: doc.context.completed (мониторинг)
+    SAGA->>PG: (информационно) сверка с task_processing_steps
+    Note over SAGA: Saga НЕ публикует doc.matching.requested —<br>это уже сделал Context Worker выше
 
-    K->>SAGA: doc.context.completed (если нужен)
-    SAGA->>PG: UPDATE task_processing_steps SET status='completed'
-
-    SAGA->>PG: Проверить все ли expected_steps завершены
-
-    alt Все шаги завершены
-        SAGA->>PG: Транзакция:<br>+ INSERT saga_commands (doc.matching.requested)<br>+ INSERT outbox_events (doc.matching.requested)<br>+ COMMIT
-        Note over SAGA: Matching запускается через Outbox
-    else Ошибка на одном из ожидаемых шагов
-        SAGA->>GW: FailTaskCommand (через Application)
-        GW->>PG: task.MarkFailed() → status='failed'
-        Note over SAGA: Компенсация:<br>- частичные результаты СОХРАНЯЮТСЯ<br>- очищаются временные файлы в MinIO
+    par Путь 1: немедленный сбой через DLQ
+        K->>SAGA: doc.ocr.dlq или doc.context.dlq
+        SAGA->>GW: FailTaskUseCase(task_id, reason='step failed after retries')
+    and Путь 2: сбой по таймауту
+        loop каждую минуту
+            TS->>PG: SELECT task_id FROM task_processing_steps<br>WHERE status IN ('requested','running') AND started_at < now() - interval 'N минут'
+            PG-->>TS: зависшие задачи
+            TS->>SAGA: сигнал таймаута по task_id
+            SAGA->>GW: FailTaskUseCase(task_id, reason='step timeout')
+        end
     end
 
-    Note over OR,K: 8. OUTBOX RELAY ПУБЛИКУЕТ MATCHING
+    GW->>PG: task.MarkFailed() → status='failed'
+    GW->>PG: Транзакция:<br>+ INSERT outbox_events (task.compensation.requested)<br>+ COMMIT
+    Note over GW,PG: Частичные валидные результаты (OCR/Context) СОХРАНЯЮТСЯ
+
+    OR->>PG: SELECT ... FOR UPDATE SKIP LOCKED
+    PG-->>OR: task.compensation.requested
+    OR->>K: публикация
+    K->>COMP: task.compensation.requested
+    COMP->>M: удаление временных/черновых артефактов
+    COMP->>PG: логирование очистки
+
+    Note over OR,K: 8. OUTBOX RELAY ПУБЛИКУЕТ MATCHING (happy path)
 
     OR->>PG: SELECT ... FOR UPDATE SKIP LOCKED
     PG-->>OR: doc.matching.requested
@@ -501,11 +611,13 @@ sequenceDiagram
 5. **Автоматическое масштабирование** — HPA/KEDA по метрикам и длине очереди
 6. **Идемпотентность** — at-least-once доставка с идемпотентной обработкой, дающая **effectively-once бизнес-эффект**
 7. **Мультимодальная обработка** — поддержка текстовых, графических и аудиоданных
-8. **Голосовые заметки** — независимый параллельный Speech-to-Text процесс, не блокирующий Matching
-9. **Saga-координация** — Matching запускается только после завершения ожидаемых шагов (OCR, Context), состав шагов динамический; вся координация через PostgreSQL durable state
-10. **Outbox pattern** — атомарная публикация событий через PostgreSQL, Relay с несколькими репликами и `SKIP LOCKED`
-11. **Real-time уведомления** — Notification Relay транслирует completion-события в WebSocket
-12. **PostgreSQL — источник истины** — Redis только для быстрого кэша/координации; при потере Redis состояние восстанавливается из PostgreSQL
+8. **Голосовые заметки** — независимый параллельный Speech-to-Text процесс, не блокирующий Matching и не отслеживаемый Saga
+9. **Единственный владелец триггера Matching** — Context Worker публикует `doc.matching.requested` напрямую через Outbox; никакого дублирования с Saga
+10. **Saga = failure/timeout detector**, а не happy-path координатор — реагирует на `*.dlq` и на сигналы Timeout Scanner'а
+11. **Outbox pattern** — атомарная публикация событий через PostgreSQL, Relay с несколькими репликами и `SKIP LOCKED`
+12. **Real-time уведомления** — Notification Relay транслирует completion-события в WebSocket
+13. **PostgreSQL — источник истины** — Redis только для быстрого кэша/координации; при потере Redis состояние восстанавливается из PostgreSQL
+14. **Компенсация асинхронна и не разрушительна** — частичные валидные результаты сохраняются, удаляются только временные артефакты
 
 ---
 
@@ -810,7 +922,7 @@ features/transcribe-voice/
 
 **Подход в FSD:**
 
-WebSocket реализован на уровне **Shared**, но используется в **Features**. Источником событий на бэкенде является **Notification Relay** (см. backend-раздел) — отдельный consumer, транслирующий `*.completed` из Kafka в WebSocket, независимо от Saga-координации:
+WebSocket реализован на уровне **Shared**, но используется в **Features**. Источником событий на бэкенде является **Notification Relay** (см. backend-раздел) — отдельный consumer, транслирующий `*.completed` из Kafka в WebSocket, независимо от Saga:
 
 ```
 shared/lib/websocket/
@@ -829,6 +941,18 @@ features/task-status/
 - `task.progress.updated` — обновление прогресса (OCR/Context/Matching завершены)
 - `voice.transcribe.completed` — транскрибация завершена
 - `notification.new` — новое уведомление
+
+**WebSocket Reconnection Strategy:**
+
+В модуле `shared/lib/websocket/WebSocketClient.ts` реализована стратегия **Exponential Backoff** с джиттером (например, 1с, 2с, 4с, 8с... макс 30с) при обрыве связи.
+
+**State Synchronization on Reconnect:**
+
+Поскольку при длительном разрыве соединения часть событий `*.completed` могла быть пропущена, при успешном восстановлении WebSocket-соединения фронтенд **автоматически инициирует** `GET /api/v1/tasks/{task_id}`, синхронизируя локальное состояние с истиной на бэкенде.
+
+**Presigned URL Expiration:**
+
+В фиче `features/upload-file` предусмотрена логика обработки истечения срока жизни Presigned URL: при ошибке `403 Forbidden` от MinIO UI показывает уведомление и автоматически запрашивает новый `upload_url`, после чего загрузка возобновляется прозрачно для пользователя.
 
 ---
 
@@ -885,20 +1009,18 @@ Backend DTO (JSON)
 
 ## Структура backend (DDD Architecture)
 
-Бэкенд построен на **Domain-Driven Design (DDD)** с четким выделением bounded contexts, агрегатов и слоев.
+Бэкенд построен на **Domain-Driven Design (DDD)** с четким выделением bounded contexts, агрегатов и слоев. Архитектура следует классическим принципам DDD с четким разделением на Transport, Application, Domain, Persistence и Shared Kernel слои.
 
 ### 🏛️ Bounded Contexts
 
-В системе выделены следующие контексты:
-
 | Bounded Context | Ответственность | Агрегаты |
 |---|---|---|
-| **Task Management** | Жизненный цикл задачи, статусы, оркестрация событий | `Task` (корень) |
+| **Task Management** | Жизненный цикл задачи, статусы | `Task` (корень) |
 | **Document Processing** | Файлы, документы, привязка к MinIO | `Document`, `File` |
 | **Voice Notes** | Голосовые заметки, транскрипция (независимый параллельный контекст) | `VoiceNote` |
 | **Identity** | JWT, права доступа (in-process, без Kafka) | `User` |
 
-**Task Management** — ядро (core domain), остальные — supporting domains. Gateway физически один сервис, но код должен отражать эти границы, чтобы потом при необходимости можно было выделить контекст в отдельный микросервис без переписывания бизнес-логики.
+**Task Management** — ядро (core domain), остальные — supporting domains.
 
 ---
 
@@ -906,77 +1028,96 @@ Backend DTO (JSON)
 
 ```mermaid
 graph TB
-    subgraph Interfaces["🌐 INTERFACES (ACL)"]
-        Handlers[HTTP Handlers<br>task_handler, upload_handler]
-        DTOs[DTOs<br>CreateTaskDTO, TaskResponseDTO]
-        Middleware[Middleware<br>JWT, Idempotency, Validation]
+    subgraph Transport["🚚 TRANSPORT LAYER"]
+        HTTPHandlers[HTTP Handlers<br>REST / GraphQL]
+        RPCHandlers[gRPC / WebSocket Handlers]
+        DTOs[DTOs / Mappers<br>CreateTaskDTO, TaskResponseDTO]
+        Middleware[Middleware<br>JWT, Idempotency, Validation, Tenant Extraction]
     end
 
     subgraph Application["⚙️ APPLICATION LAYER"]
-        Commands[Commands<br>CreateTask, ConfirmUpload, FailTask]
-        Queries[Queries<br>GetTaskStatus, GetProtocol]
-        EventPublisher[Event Publisher<br>Domain → Integration Events]
-        SagaOrchestrator[Saga Orchestrator<br>Consumer + Coordinator]
+        CreateTaskUseCase[CreateTaskUseCase]
+        ConfirmUploadUseCase[ConfirmUploadUseCase]
+        FailTaskUseCase[FailTaskUseCase]
+        GetTaskStatusQuery[GetTaskStatusQuery]
+        GetProtocolQuery[GetProtocolQuery]
+        SagaOrchestrator[Saga Orchestrator<br>Failure/Timeout Detector<br>НЕ триггерит Matching]
         NotifyRelay[Notification Relay<br>Consumer → WebSocket]
     end
 
     subgraph Domain["🧠 DOMAIN LAYER"]
         subgraph TaskContext["Task Management Context"]
-            TaskAggregate[Task Aggregate Root<br>инкапсулирует статусы]
-            TaskEvents[Domain Events<br>TaskCreated, TaskReady, TaskProcessingStarted]
+            TaskAggregate[Task Aggregate Root<br>+ tenant_id]
+            TaskEntity[Task Entity]
+            TaskStatusVO[TaskStatus Value Object]
+            TaskDomainService[Task Domain Service]
+            TaskCreatedEvent[Domain Event<br>TaskCreated]
             TaskRepository[TaskRepository<br>интерфейс]
         end
 
         subgraph DocumentContext["Document Processing Context"]
-            DocumentAggregate[Document Aggregate Root]
+            DocumentAggregate[Document Aggregate Root<br>+ tenant_id]
+            DocumentEntity[Document Entity]
             FileEntity[File Entity]
+            DocumentTypeVO[DocumentType Value Object]
+            DocumentDomainService[Document Domain Service]
             DocumentRepository[DocumentRepository<br>интерфейс]
         end
 
         subgraph VoiceContext["Voice Notes Context"]
-            VoiceNoteAggregate[VoiceNote Aggregate Root]
+            VoiceNoteAggregate[VoiceNote Aggregate Root<br>+ tenant_id]
+            VoiceNoteEntity[VoiceNote Entity]
             TranscriptVO[Transcript Value Object]
+            VoiceNoteDomainService[VoiceNote Domain Service]
             VoiceRepository[VoiceRepository<br>интерфейс]
         end
 
         subgraph IdentityContext["Identity Context (in-process)"]
             UserAggregate[User Aggregate Root]
+            UserEntity[User Entity]
             PermissionVO[Permission Value Object]
+            UserRepository[UserRepository<br>интерфейс]
         end
     end
 
-    subgraph Infrastructure["🔌 INFRASTRUCTURE LAYER"]
-        PostgresRepo[PostgreSQL Repository]
+    subgraph Persistence["💾 PERSISTENCE LAYER (Repository Impl.)"]
+        PostgresRepo[PostgreSQL Repository<br>реализации + фильтрация по tenant_id]
         PostgresOutbox[PostgreSQL Outbox<br>+ Outbox Relay]
-        MinIOAdapter[MinIO Storage Adapter]
-        KafkaProducer[Kafka Event Publisher]
-        KafkaConsumerSaga[Kafka Consumer<br>Saga: ocr/context.completed]
-        KafkaConsumerNotify[Kafka Consumer<br>Notify: все *.completed]
-        RedisStore[Redis Store<br>Idempotency, Saga State]
+
+        subgraph ExternalAdapters["External Adapters (Tech Details)"]
+            MinIOAdapter[MinIO Storage Adapter]
+            KafkaProducer[Kafka Event Publisher]
+            KafkaConsumerSaga[Kafka Consumer<br>Saga: ocr/context.completed (мониторинг)<br>+ ocr/context.dlq (сбой)]
+            KafkaConsumerNotify[Kafka Consumer<br>Notify: все *.completed]
+            RedisStore[Redis Store<br>Idempotency, Saga State cache]
+        end
     end
 
     subgraph Shared["🔄 SHARED KERNEL"]
         EventBus[Event Bus Interface]
         IdempotencyKey[Idempotency Key]
         AggregateBase[Aggregate Base Interfaces]
+        ValueObjectBase[Value Object Base]
+        EntityBase[Entity Base]
     end
 
-    Interfaces --> Application
+    Transport --> Application
     Application --> Domain
-    Application --> Infrastructure
-    Infrastructure --> Shared
+    Application --> Persistence
+    Persistence --> Domain
+    Persistence --> Shared
     Domain --> Shared
 
-    classDef interfaces fill:#4dabf7,stroke:#1971c2,color:#fff
+    classDef transport fill:#4dabf7,stroke:#1971c2,color:#fff
     classDef application fill:#ffd43b,stroke:#e67700
     classDef domain fill:#69db7c,stroke:#2b8a3e,color:#fff
-    classDef infrastructure fill:#ff6b6b,stroke:#c92a2a,color:#fff
+    classDef persistence fill:#ff6b6b,stroke:#c92a2a,color:#fff
     classDef shared fill:#d0bfff,stroke:#6741d9
 
-    class Interfaces interfaces
+    class Transport transport
     class Application application
     class Domain domain
-    class Infrastructure infrastructure
+    class Persistence persistence
     class Shared shared
 ```
 
@@ -984,20 +1125,60 @@ graph TB
 
 ### 🧩 Описание слоев
 
-#### 1. Domain Layer (Бизнес-логика)
+#### 1. Transport Layer (Сетевой слой / ACL)
 
-**Ответственность:** Чистая бизнес-логика, инварианты, правила предметной области.
+**Ответственность:** Внешний контракт, маппинг HTTP/gRPC/WebSocket ↔ DTO ↔ Commands/Queries. Это **Anti-Corruption Layer (ACL)**, защищающий домен от внешних изменений.
 
-**Принципы:**
-- Доменный слой **ничего не импортирует** (чистая бизнес-логика)
-- Сущности содержат поведение, а не только данные
-- Агрегаты — корневые сущности, через которые происходит вся работа
-- Value Objects неизменяемы и самовалидируемы
-- Репозитории — только интерфейсы (Ports)
+**Компоненты:**
+- **HTTP Handlers** — REST и GraphQL эндпоинты
+- **gRPC / WebSocket Handlers** — для внутренней коммуникации и real-time уведомлений
+- **DTOs / Mappers** — объекты передачи данных и преобразователи
+- **Middleware:**
+  - **JWT-аутентификация**
+  - **Idempotency Middleware** — проверка `idempotency_key` в таблице `idempotency_keys` до начала бизнес-транзакции; возвращает кэшированный ответ при повторе
+  - **Tenant Extraction** — извлечение `tenant_id` из JWT для фильтрации на уровне Persistence
+  - **Validation** — проверка структуры и типов входных данных
 
-**Ключевые элементы:**
+---
 
-**Task Aggregate Root** — инкапсулирует переходы статусов, не позволяет менять их напрямую снаружи:
+#### 2. Application Layer (Бизнес-логика / Use-cases)
+
+**Ответственность:** Оркестрация use-case'ов.
+
+**Commands:**
+- `CreateTaskUseCase`
+- `ConfirmUploadUseCase`
+- `FailTaskUseCase` — переводит задачу в `failed` **и** публикует `task.compensation.requested`; вызывается **только** Saga Orchestrator'ом по сигналу DLQ или Timeout Scanner'а
+
+**Queries:**
+- `GetTaskStatusQuery`
+- `GetProtocolQuery`
+
+**Координаторы:**
+
+- **Saga Orchestrator** — **failure/timeout detector**, не более:
+  - Слушает `doc.ocr.completed` / `doc.context.completed` **только для сверки состояния** в `task_processing_steps` (это нужно, чтобы Timeout Scanner понимал, какие шаги уже завершены и не должен по ним сигналить)
+  - Слушает `doc.ocr.dlq` / `doc.context.dlq` — при получении немедленно вызывает `FailTaskUseCase`
+  - Получает сигналы от Timeout Scanner'а — при получении вызывает `FailTaskUseCase`
+  - **Никогда не публикует `doc.matching.requested`** — эта публикация принадлежит исключительно Context Worker'у
+- **Timeout Scanner** — периодический (CronJob) сканер `task_processing_steps`, ищущий шаги в статусе `requested`/`running` дольше порога; не Kafka-consumer, а прямой polling PostgreSQL
+- **Notification Relay** — Consumer → WebSocket, слушает все `*.completed`, не участвует в бизнес-координации
+
+**Event Publisher:**
+- Маппинг Domain Events → Integration Events
+- Использует **Outbox pattern** для атомарной публикации
+
+**Компенсация при ошибке:**
+- `FailTaskUseCase` атомарно обновляет статус задачи на `failed` и публикует `task.compensation.requested` через Outbox
+- **Очистка временных файлов в MinIO** выполняется отдельным асинхронным Compensation Worker'ом, подписанным на это событие — основная транзакция не блокируется медленными вызовами к S3
+
+---
+
+#### 3. Domain Layer (Сущности и бизнес-правила)
+
+**Ответственность:** Чистые сущности, Value Objects, агрегаты и доменные сервисы.
+
+**Task Aggregate Root:**
 
 ```go
 // domain/task.go
@@ -1005,8 +1186,8 @@ type Task struct {
     id             TaskID
     status         TaskStatus
     taskType       TaskType
-    expectedSteps  []ProcessingStep // напр. [OCR, Context] — определяется при создании
-    events         []DomainEvent    // накопленные для публикации
+    expectedSteps  []ProcessingStep // ["ocr", "context"] — для Timeout Scanner
+    events         []DomainEvent
 }
 
 func (t *Task) MarkReady() error {
@@ -1019,6 +1200,10 @@ func (t *Task) MarkReady() error {
 }
 
 func (t *Task) MarkFailed(reason string) error {
+    if t.status == StatusFailed {
+        return nil // идемпотентный no-op: защита от двойного FailTaskUseCase
+                    // (например, при гонке DLQ-сигнала и Timeout Scanner'а)
+    }
     if t.status == StatusCompleted {
         return ErrAlreadyCompleted
     }
@@ -1028,130 +1213,48 @@ func (t *Task) MarkFailed(reason string) error {
 }
 ```
 
-**Domain Events vs Integration Events:**
+**Bounded Contexts и их компоненты:**
 
-Это разделение критически важно:
-- **Domain Event** (`TaskReady`) — живёт внутри контекста, синхронный, in-process.
-- **Integration Event** (`doc.ocr.requested` в Kafka) — публикуется наружу, за пределы bounded context.
+**Task Management Context:** `TaskAggregate`, `TaskEntity`, `TaskStatusVO`, `TaskDomainService`, `TaskCreatedEvent`, `TaskRepository`
 
-Маппинг между ними происходит в `application/event_publisher.go` — это то место, где реализуется логика "какие события публиковать в зависимости от task_type и process". Здесь же формируется `expectedSteps` — набор шагов, за которыми будет следить Saga (см. ниже).
+**Document Processing Context:** `DocumentAggregate`, `DocumentEntity`, `FileEntity`, `DocumentTypeVO`, `DocumentDomainService`, `DocumentRepository`
 
----
+**Voice Notes Context:** `VoiceNoteAggregate`, `VoiceNoteEntity`, `TranscriptVO`, `VoiceNoteDomainService`, `VoiceRepository`
 
-#### 2. Application Layer (Use-cases)
+**Identity Context (in-process):** `UserAggregate`, `UserEntity`, `PermissionVO`, `UserRepository` — интерфейс определён как Port, в будущем заменим на gRPC-клиент к внешнему Identity Provider без изменений в Domain-слое
 
-**Ответственность:** Оркестрация use-case'ов, координация между доменом и инфраструктурой.
-
-**Принципы:**
-- Сервисы НЕ содержат бизнес-логики — только оркестрацию
-- Каждый use-case — отдельный Command или Query
-- Команды принимают DTO, возвращают DTO
-- Валидация — проверка структуры и типов (защита от дурака)
-
-**Ключевые элементы:**
-
-**Command Handlers:**
-- `CreateTaskCommand` — создание задачи
-- `ConfirmUploadCommand` — подтверждение загрузки
-- `StartProcessingCommand` — запуск обработки, фиксирует `expectedSteps` для Saga
-- `FailTaskCommand` — перевод задачи в статус `failed` (вызывается Saga при ошибке)
-
-**Query Handlers:**
-- `GetTaskStatusQuery` — получение статуса
-- `GetProtocolQuery` — получение протокола
-
-**Event Publisher:**
-- Маппинг Domain Events → Integration Events
-- Решение, какие события публиковать в Kafka (в зависимости от task_type и process)
-- Использует **Outbox pattern** для атомарной публикации
-
-**Saga Orchestrator:**
-- Слушает **только** `doc.ocr.completed` и `doc.context.completed` — шаги, обязательные для Matching
-- **Voice Transcribe в saga-гейт не входит**: это независимый параллельный процесс, его завершение не блокирует запуск Matching
-- При инициализации задачи получает `expectedSteps` (какие шаги реально были запрошены для конкретного `task_id`) и хранит их в PostgreSQL как durable-состояние
-- Решает, когда запускать Matching (когда все `expectedSteps` завершены)
-- При ошибке вызывает `FailTaskCommand` (через Application, не напрямую в агрегат)
-- Инициирует компенсацию (см. ниже)
-- **Все решения принимаются на основе PostgreSQL**, Redis используется только как быстрый кэш
-
-**Notification Relay:**
-- Слушает **все** `*.completed`-события (`doc.ocr.completed`, `doc.context.completed`, `doc.matching.completed`, `voice.transcribe.completed`)
-- Транслирует их в WebSocket-сообщения для клиента
-- Не участвует в бизнес-координации, не пишет в PostgreSQL/Redis saga-state — чисто presentation-слой поверх Kafka
+**Multi-tenancy:**
+- Все корневые агрегаты (`Task`, `Document`, `VoiceNote`) содержат `tenant_id`
+- Доменные правила гарантируют, что сущность не может быть изменена или создана без привязки к владельцу
 
 ---
 
-#### 3. Infrastructure Layer (Инфраструктура)
+#### 4. Persistence Layer (Инфраструктура / Репозитории)
 
-**Ответственность:** Технические детали, реализация репозиториев, адаптеры.
+**PostgreSQL Repository:**
+- Реализации `TaskRepository`, `DocumentRepository`, `VoiceRepository`, `UserRepository`
+- **Строгое правило изоляции данных:** все реализации репозиториев обязаны включать `WHERE tenant_id = ?` на уровне SQL
 
-**Принципы:**
-- Реализует интерфейсы из Domain слоя
-- Не содержит бизнес-логики
-- Все внешние зависимости инкапсулированы
+**PostgreSQL Outbox:**
+- Таблица `outbox_events`
+- `Outbox Relay` — несколько реплик, `SELECT FOR UPDATE SKIP LOCKED`
 
-**Ключевые элементы:**
-- **PostgreSQL Repository** — сохранение и загрузка агрегатов целиком
-- **PostgreSQL Outbox** — таблица для атомарной публикации событий + отдельный Relay-процесс (несколько реплик с SKIP LOCKED)
+**External Adapters:**
 - **MinIO Adapter** — Presigned URL, upload/download
-- **Kafka Producer** — публикация Integration Events (через Outbox Relay, **никаких прямых публикаций**)
-- **Kafka Consumer (Saga)** — чтение `doc.ocr.completed` / `doc.context.completed`
-- **Kafka Consumer (Notify)** — чтение всех `*.completed`
-- **Redis Store** — быстрый кэш для Saga-состояния (восстанавливается из PostgreSQL)
+- **Kafka Producer** — публикация Integration Events (только через Outbox Relay, никаких прямых публикаций)
+- **Kafka Consumer (Saga)** — `doc.ocr.completed` / `doc.context.completed` (мониторинг) + `doc.ocr.dlq` / `doc.context.dlq` (сбой)
+- **Kafka Consumer (Notify)** — все `*.completed`
+- **Redis Store** — быстрый кэш для состояния шагов (восстанавливается из PostgreSQL)
 
 ---
 
-#### 4. Interfaces Layer (Anti-Corruption Layer)
+#### 5. Shared Kernel
 
-**Ответственность:** Внешний контракт, маппинг HTTP ↔ DTO ↔ Commands.
-
-**Принципы:**
-- DTO из HTTP-запроса не должны "протекать" в domain-модели напрямую
-- Хендлер транслирует DTO → Command (`CreateTaskCommand`)
-- ACL защищает домен от внешних изменений
-
----
-
-### 📋 Ubiquitous Language (Глоссарий)
-
-Для единообразия терминов в коде, документации и Kafka-схемах формализован следующий глоссарий:
-
-| Термин | Описание |
-|--------|----------|
-| **Task** | Задача на обработку документа/документов |
-| **Task Status** | Состояние задачи: pending → accepted → ready → processing → completed/failed |
-| **Task Type** | Тип задачи: upload_and_process, process_only, compare |
-| **Expected Steps** | Динамический набор шагов (OCR/Context), которые Saga ожидает для конкретной задачи |
-| **Document** | Документ (ПД/РД/ИД) |
-| **File** | Физический файл, привязанный к документу |
-| **Voice Note** | Голосовая заметка инспектора (независимый параллельный процесс) |
-| **Transcript** | Транскрибированный текст из голосовой заметки |
-| **Discrepancy** | Расхождение между документами |
-| **Protocol** | Протокол несоответствий (сводка расхождений) |
-| **Processing** | Этапы: OCR → Context → Matching (Voice — параллельно, вне гейта) |
-| **Saga** | Координатор распределённого процесса (слушает completion-события OCR/Context) |
-| **Notification Relay** | Consumer, транслирующий все completion-события в WebSocket |
-| **Outbox** | Паттерн атомарной публикации событий через БД |
-| **Idempotency Key** | Ключ для предотвращения дублирующей обработки |
-| **Effectively-once** | At-least-once доставка + идемпотентная обработка = бизнес-эффект ровно один раз |
-
----
-
-### 🎯 Ключевые DDD-паттерны
-
-| Паттерн | Где используется |
-|---------|------------------|
-| **Aggregate Root** | Task, Document, VoiceNote — корневые агрегаты |
-| **Value Object** | TaskStatus, TaskType, DocumentType, FileSize, Transcript |
-| **Repository** | Интерфейсы для работы с агрегатами |
-| **Domain Events** | TaskCreated, TaskReady, FileUploaded |
-| **Integration Events** | doc.ocr.requested, doc.matching.requested |
-| **Application Services** | Use-cases (CreateTask, ConfirmUpload) |
-| **Saga/Process Manager** | Оркестрация OCR → Context → Matching (динамический гейт) |
-| **Anti-Corruption Layer** | HTTP Handlers → DTO → Commands |
-| **Shared Kernel** | EventBus, IdempotencyKey, AggregateBase |
-| **Factory** | Создание агрегатов |
-| **Outbox** | Атомарная публикация событий |
+- **Event Bus Interface**
+- **Idempotency Key**
+- **Aggregate Base**
+- **Value Object Base**
+- **Entity Base**
 
 ---
 
@@ -1160,93 +1263,141 @@ func (t *Task) MarkFailed(reason string) error {
 ```
 HTTP Request (JSON)
     ↓
-Interfaces/Handler (парсинг DTO)
+Transport/Handler (парсинг DTO)
     ↓
-Interfaces/Middleware (JWT, Idempotency)
+Transport/Middleware (JWT, Idempotency, Tenant Extraction)
     ↓
-Application/Command (валидация, создание Command)
+Application/Command (валидация)
     ↓
-Application/Handler (оркестрация)
+Application/UseCase (бизнес-логика, оркестрация)
     ↓
-Domain/Aggregate (бизнес-логика, проверка инвариантов, expectedSteps)
+Domain/Aggregate (инварианты, проверка правил)
     ↓
 Domain/Event (генерация Domain Events)
     ↓
 Application/EventPublisher (маппинг в Integration Events)
     ↓
-Infrastructure/Outbox (сохранение в БД + событие в outbox, одна транзакция)
+Persistence/Outbox (сохранение в БД + событие в outbox, одна транзакция)
     ↓
-Infrastructure/Outbox Relay (публикация в Kafka из outbox)
+Persistence/Outbox Relay (публикация в Kafka с SKIP LOCKED)
     ↓
-Infrastructure/PostgreSQL (агрегат уже сохранён на этом этапе)
+Persistence/PostgreSQL (агрегат сохранён)
 ```
 
 ---
 
-### 🔄 Saga Orchestrator (Координация процессов)
+### 📋 Ubiquitous Language (Глоссарий)
 
-**Ответственность:** Управление распределёнными транзакциями между bounded contexts. Гейтит **только** запуск Matching.
-
-**Принцип работы:**
-1. При старте обработки задачи (`StartProcessingCommand`) Application формирует `expectedSteps` — динамический список: включён ли OCR, включён ли Context (на основе `task_type`/`process`). Voice в этот список **не входит**.
-2. Saga слушает Integration Events: `doc.ocr.completed`, `doc.context.completed`
-3. Хранит durable-состояние в PostgreSQL (`task_processing_steps`)
-4. Redis используется только как быстрый кэш для проверки состояния
-5. Когда **все шаги из expectedSteps** завершены — создаёт запись в `saga_commands` и `outbox_events` для Matching
-6. При ошибке — инициирует компенсацию через `FailTaskCommand`
-
-**Схема Saga:**
-
-```
-TaskCreated (Gateway)
-    ↓
-Application формирует expectedSteps для task_id, например: ["ocr", "context"]
-(если Matching для задачи не нужен вовсе — Saga для неё не создаётся)
-    ↓
-Запуск OCR (если включён) → doc.ocr.requested
-Запуск Context (если включён) → doc.context.requested (после OCR)
-Запуск Voice (если включён) → voice.transcribe.requested  [ПАРАЛЛЕЛЬНО, вне Saga-гейта]
-    ↓
-Saga ожидает completion-события ТОЛЬКО по expectedSteps:
-    - doc.ocr.completed      (если "ocr" ∈ expectedSteps)
-    - doc.context.completed  (если "context" ∈ expectedSteps)
-    ↓
-Хранит durable-состояние в PostgreSQL:
-    task_processing_steps (task_id, step, status)
-    ↓
-Redis кэширует это состояние для быстрых проверок
-    ↓
-Когда все expected steps завершены → создаёт:
-    - saga_commands (doc.matching.requested)
-    - outbox_events (doc.matching.requested)
-    ↓
-Outbox Relay → Kafka → Matching Worker
-Если ошибка → FailTaskCommand (через Application, не напрямую)
-```
-
-**Компенсация при ошибке — что именно происходит:**
-- Частичные результаты OCR/Context, уже сохранённые в PostgreSQL, **не удаляются** — они самодостаточны и валидны сами по себе (например, полезны для последующего ретрая только упавшего шага)
-- Очищаются только временные/промежуточные артефакты в MinIO (черновые файлы конвертации, не финальные результаты)
-- Причина ошибки и `task_id` логируются в PostgreSQL для последующего разбора
-- Task переводится в статус `failed` через `task.MarkFailed()`, вызванный из `FailTaskCommand`
-
-**Saga не трогает Task напрямую!** Она вызывает `FailTaskCommand` через Application Layer, который уже внутри вызывает метод агрегата `MarkFailed()`. Это сохраняет инвариант "агрегат — единственная точка изменений".
-
-**Voice Transcribe и Notification Relay работают независимо от Saga** — их completion-события идут напрямую в Notification Relay и доставляются клиенту по WebSocket, не дожидаясь и не влияя на решение Saga о запуске Matching.
-
-**Восстановление Redis из PostgreSQL:**
-- При старте Saga-пода выполняется проверка незавершённых задач в `task_processing_steps`
-- Состояние загружается в Redis для быстрого доступа
-- При потере Redis (перезапуск, сбой) состояние восстанавливается из PostgreSQL
+| Термин | Описание |
+|--------|----------|
+| **Task** | Задача на обработку документа/документов |
+| **Task Status** | pending → accepted → ready → processing → completed/failed |
+| **Task Type** | upload_and_process, process_only, compare |
+| **Expected Steps** | Список шагов (OCR/Context), которые Timeout Scanner ожидает для задачи |
+| **Document** | Документ (ПД/РД/ИД) |
+| **File** | Физический файл, привязанный к документу |
+| **Voice Note** | Голосовая заметка инспектора (независимый параллельный процесс) |
+| **Transcript** | Транскрибированный текст |
+| **Discrepancy** | Расхождение между документами |
+| **Protocol** | Протокол несоответствий |
+| **Processing** | OCR → Context → Matching (цепочка через Outbox воркер-к-воркеру; Voice — параллельно) |
+| **Saga** | Failure/timeout detector: реагирует на `*.dlq` и таймауты, вызывает компенсацию. **Не публикует `doc.matching.requested`** |
+| **Timeout Scanner** | Периодический job, сканирующий зависшие шаги в `task_processing_steps` |
+| **Notification Relay** | Consumer, транслирующий все completion-события в WebSocket |
+| **Outbox** | Паттерн атомарной публикации событий через БД |
+| **Idempotency Key** | Ключ для предотвращения дублирующей обработки |
+| **Effectively-once** | At-least-once доставка + идемпотентная обработка = бизнес-эффект ровно один раз |
+| **Tenant** | Арендатор/пользователь, владелец данных (изоляция) |
 
 ---
 
-### 📦 Outbox Pattern (Атомарная публикация)
+### 🎯 Ключевые DDD-паттерны
 
-Для гарантии, что событие будет опубликовано ровно один раз и только после успешного сохранения агрегата, используется **Outbox pattern**:
+| Паттерн | Где используется |
+|---------|------------------|
+| **Aggregate Root** | Task, Document, VoiceNote |
+| **Value Object** | TaskStatus, TaskType, DocumentType, FileSize, Transcript, Permission |
+| **Repository** | TaskRepository, DocumentRepository, VoiceRepository, UserRepository |
+| **Domain Events** | TaskCreated, TaskReady, FileUploaded, TaskFailed |
+| **Integration Events** | doc.ocr.requested, doc.matching.requested, task.compensation.requested |
+| **Application Services** | CreateTaskUseCase, ConfirmUploadUseCase, FailTaskUseCase |
+| **Process Manager (сужен)** | Saga — только failure/timeout detection |
+| **Anti-Corruption Layer** | Transport Layer |
+| **Shared Kernel** | EventBus, IdempotencyKey, AggregateBase, EntityBase |
+| **Factory** | Создание агрегатов |
+| **Outbox** | Атомарная публикация событий, единственный владелец на топик |
+| **CQRS** | Commands (CreateTask) / Queries (GetTaskStatus) |
+| **Domain Service** | TaskDomainService, DocumentDomainService |
+
+---
+
+### 🔄 Saga Orchestrator: только Failure/Timeout Detection
+
+**Ответственность:** обнаружение сбоев и таймаутов на шагах OCR/Context, запуск компенсации. **Не участвует в happy path.**
+
+**Почему happy path не через Saga:** цепочка OCR → Context → Matching строго последовательна (Context физически не может завершиться раньше OCR, Matching — раньше Context), поэтому каждый шаг естественно триггерит следующий через собственную Outbox-транзакцию. Дополнительный координатор для этого не нужен и создавал риск двойной публикации одного и того же события (был обнаружен и устранён в этой версии).
+
+**Два независимых источника сигнала о сбое:**
+
+1. **DLQ (немедленный сбой):**
+```
+OCR/Context Worker исчерпал retry
+    ↓
+Публикация в doc.ocr.dlq / doc.context.dlq
+    ↓
+Saga читает DLQ-топик
+    ↓
+FailTaskUseCase(task_id, reason='step failed after retries')
+```
+
+2. **Timeout (сбой без явного сигнала — например, под воркера убит OOMKill без возможности опубликовать DLQ-сообщение):**
+```
+Timeout Scanner (CronJob, раз в минуту)
+    ↓
+SELECT task_id, step FROM task_processing_steps
+WHERE status IN ('requested', 'running')
+  AND started_at < now() - interval 'N минут'
+    ↓
+Для каждой зависшей задачи → сигнал Saga
+    ↓
+FailTaskUseCase(task_id, reason='step timeout')
+```
+
+**Компенсация:**
+1. Saga вызывает `FailTaskUseCase(task_id, reason)`
+2. Use Case атомарно: `Task.MarkFailed(reason)` → сохранение через `TaskRepository` → публикация `task.compensation.requested` через Outbox
+3. Compensation Worker читает событие, удаляет временные/черновые артефакты из MinIO
+4. Частичные валидные результаты (например, успешно распознанный OCR-текст) **сохраняются** для возможного ручного/автоматического ретрая
+
+**Saga не трогает Task напрямую!** Она вызывает `FailTaskUseCase` через Application Layer, который вызывает `MarkFailed()` — инвариант "агрегат — единственная точка изменений" сохраняется.
+
+**Восстановление после рестарта:**
+- При старте Saga-consumer'а состояние `task_processing_steps` уже находится в PostgreSQL (durable), Redis используется только как кэш для UI-прогресса
+- При потере Redis прогресс-бар на фронте временно теряет промежуточные данные, но при следующем `GET /api/v1/tasks/{task_id}` синхронизируется из PostgreSQL — бизнес-корректность не страдает
+
+---
+
+### 📦 Схемы баз данных
+
+#### Таблица идемпотентности (Transport Layer)
 
 ```sql
--- Таблица outbox
+CREATE TABLE idempotency_keys (
+    key TEXT PRIMARY KEY,
+    task_id UUID,
+    response_payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL  -- created_at + 24 часа
+);
+
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+```
+
+**Политика TTL:** `expires_at = created_at + 24 часа` — этого достаточно, чтобы покрыть retry-паттерны клиента (включая ручной повтор пользователем после долгого разрыва сети), не раздувая таблицу бесконечно. Очистка истекших ключей — отдельный CronJob раз в час: `DELETE FROM idempotency_keys WHERE expires_at < now()`, использующий индекс `idx_idempotency_expires`.
+
+#### Outbox-таблица (Persistence Layer)
+
+```sql
 CREATE TABLE outbox_events (
     event_id       UUID PRIMARY KEY,
     aggregate_id   UUID NOT NULL,
@@ -1266,7 +1417,7 @@ CREATE TABLE outbox_events (
 );
 
 CREATE INDEX outbox_pending_idx
-ON outbox_events (available_at, created_at)
+ON outbox_events (status, available_at, created_at)
 WHERE status IN ('pending', 'publishing', 'failed');
 ```
 
@@ -1279,60 +1430,31 @@ WITH batch AS (
     WHERE
         (
             status = 'pending'
-            OR (
-                status = 'publishing'
-                AND locked_at < now() - interval '2 minutes'
-            )
-            OR (
-                status = 'failed'
-                AND available_at <= now()
-            )
+            OR (status = 'publishing' AND locked_at < now() - interval '2 minutes')
+            OR (status = 'failed' AND available_at <= now())
         )
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
     LIMIT 100
 )
 UPDATE outbox_events o
-SET
-    status = 'publishing',
-    locked_at = now(),
-    attempts = attempts + 1
+SET status = 'publishing', locked_at = now(), attempts = attempts + 1
 FROM batch
 WHERE o.event_id = batch.event_id
 RETURNING o.*;
 ```
 
-**После успешной публикации:**
-
 ```sql
 UPDATE outbox_events
-SET
-    status = 'published',
-    published_at = now(),
-    locked_at = NULL
-WHERE event_id = $1
-  AND status = 'publishing';
+SET status = 'published', published_at = now(), locked_at = NULL
+WHERE event_id = $1 AND status = 'publishing';
 ```
 
-**Критическое правило:** `event_id` создаётся **один раз при создании события** и никогда не меняется при retry.
-
-**Преимущества:**
-- Гарантия атомарности (либо всё сохранено, либо ничего)
-- Возможность ретраев при сбоях Kafka
-- Аудит всех событий
-- **Высокая доступность** благодаря нескольким репликам с SKIP LOCKED
+**Критическое правило:** `event_id` создаётся один раз при создании события и никогда не меняется при retry.
 
 ---
 
 ### 📡 Идемпотентность Consumer'ов
-
-Каждый consumer должен атомарно записывать:
-
-1. факт обработки события;
-2. бизнес-результат;
-3. исходящее событие, если оно есть.
-
-**Таблица consumed_events:**
 
 ```sql
 CREATE TABLE consumed_events (
@@ -1343,33 +1465,16 @@ CREATE TABLE consumed_events (
 );
 ```
 
-**Обработка события в воркере:**
+**Обработка события в воркере (одна транзакция):**
 
 ```sql
 BEGIN;
-
 INSERT INTO consumed_events (consumer_name, event_id)
 VALUES ('ocr-worker', :event_id)
 ON CONFLICT DO NOTHING;
+-- 0 строк вставлено → уже обработано → ROLLBACK/COMMIT без эффекта, ack
+-- 1 строка вставлена → сохранить результат + outbox-событие → COMMIT, ack
 ```
-
-Если вставлено `0` строк — событие уже обработано:
-
-```
-ROLLBACK/COMMIT без повторного эффекта
-ack Kafka message
-```
-
-Если вставлено `1` строка:
-
-```
-сохранить бизнес-результат
-создать outbox-событие (completion)
-COMMIT
-ack Kafka message
-```
-
-**Ключевой момент:** запись в `consumed_events`, бизнес-результат и completion-событие должны находиться **в одной PostgreSQL-транзакции**.
 
 **Дополнительная защита бизнес-ключом:**
 
@@ -1380,26 +1485,18 @@ CREATE UNIQUE INDEX matching_result_once_idx ON discrepancies (task_id, processi
 CREATE UNIQUE INDEX voice_result_once_idx ON voice_results (task_id, voice_id);
 ```
 
-Для каждого шага должны быть определены:
-
-```
-task_id
-step
-processing_version
-event_id
-```
-
-Повторный запуск той же версии не должен создать новый результат.
-
 ---
 
-### 🗄️ Durable Saga State (PostgreSQL)
+### 🗄️ Состояние шагов обработки (для Timeout Scanner)
 
 ```sql
+-- Содержит ТОЛЬКО шаги, потенциально влияющие на запуск Matching: 'ocr' и 'context'.
+-- Voice Transcribe в эту таблицу не попадает — он не отслеживается ни Saga,
+-- ни Timeout Scanner'ом (см. раздел Voice Transcribe-воркеры выше).
 CREATE TABLE task_processing_steps (
     task_id          UUID NOT NULL,
-    step             TEXT NOT NULL,
-    status           TEXT NOT NULL,
+    step             TEXT NOT NULL,      -- 'ocr' | 'context'
+    status           TEXT NOT NULL,      -- pending | requested | running | completed | skipped | failed
     attempt          INTEGER NOT NULL DEFAULT 0,
     event_id         UUID,
     started_at       TIMESTAMPTZ,
@@ -1409,25 +1506,27 @@ CREATE TABLE task_processing_steps (
     error_message    TEXT,
     PRIMARY KEY (task_id, step)
 );
+
+-- Индекс под запрос Timeout Scanner'а — без него полный скан таблицы
+-- со временем становится узким местом по мере роста истории задач.
+CREATE INDEX idx_steps_timeout_scan ON task_processing_steps (status, started_at);
+
+-- Используется Timeout Scanner'ом:
+-- SELECT task_id, step FROM task_processing_steps
+-- WHERE status IN ('requested','running') AND started_at < now() - interval 'N минут'
+-- Статус 'skipped' (шаг был неприменим для task_type, см. ветвление OCR-воркера)
+-- не попадает в это условие и не может вызвать ложный таймаут.
 ```
 
-Статусы:
+> **Важно:** эта таблица используется **исключительно для мониторинга и обнаружения таймаутов**. Она не участвует в решении "запускать ли Matching" — это решение принимает единолично OCR/Context Worker (в зависимости от того, нужен ли Context для конкретного `task_type`) в момент сохранения своего результата.
 
-```
-pending
-requested
-running
-completed
-failed
-```
-
-### 📋 Saga Commands
+#### Saga Commands (компенсация, не Matching)
 
 ```sql
 CREATE TABLE saga_commands (
     command_id       UUID PRIMARY KEY,
     task_id          UUID NOT NULL,
-    command_type     TEXT NOT NULL,
+    command_type     TEXT NOT NULL,   -- 'task.compensation.requested'
     status           TEXT NOT NULL DEFAULT 'pending',
     payload          JSONB NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1435,22 +1534,19 @@ CREATE TABLE saga_commands (
     last_error       TEXT,
     UNIQUE (task_id, command_type)
 );
-
--- Matching допускается только один раз для конкретной версии процесса
-CREATE UNIQUE INDEX saga_matching_once
-ON saga_commands (task_id, command_type)
-WHERE command_type = 'doc.matching.requested';
 ```
 
-### 🚀 Redis — быстрый кэш/координатор
+> В предыдущей версии эта таблица также использовалась для `doc.matching.requested`, что приводило к дублированию с прямой публикацией из Context/OCR Worker'а. В этой версии `saga_commands` фиксирует **только компенсирующие команды**; `doc.matching.requested` публикуется напрямую из транзакции Context/OCR Worker'а через `outbox_events`, минуя `saga_commands`.
+>
+> **Зачем `saga_commands` всё же нужна, а не избыточна:** `consumed_events` защищает от повторной обработки одного и того же Kafka-сообщения (at-least-once доставка). Но `FailTaskUseCase` для одной задачи может быть вызван **двумя независимыми путями с разными `event_id`** — сигналом от DLQ и сигналом от Timeout Scanner'а, теоретически почти одновременно. `UNIQUE(task_id, command_type)` на `saga_commands` — это второй, БД-уровневый рубеж защиты от двойной компенсации, дополняющий идемпотентную проверку статуса внутри самого агрегата `Task.MarkFailed()` (см. Domain Layer).
 
-**Redis-структура:**
+---
+
+### 🚀 Redis — быстрый кэш/координатор
 
 ```
 saga:{task_id}
 ```
-
-Значение:
 
 ```json
 {
@@ -1460,45 +1556,22 @@ saga:{task_id}
   "expected": ["ocr", "context"],
   "completed": ["ocr"],
   "failed": [],
-  "matching": "not_requested",
   "version": 4,
   "updated_at": "2026-08-19T18:00:00Z"
 }
 ```
 
-**Атомарная обработка completion-события через Lua-скрипт:**
-
-При получении `doc.ocr.completed` Saga должна атомарно:
-
-1. проверить, что событие ещё не обработано;
-2. добавить `ocr` в completed;
-3. проверить `completed == expected`;
-4. установить `matching = requested`, если все шаги завершены;
-5. вернуть решение: публиковать Matching или нет.
-
-Lua-скрипт возвращает одно из состояний:
-
-```
-DUPLICATE
-STEP_RECORDED_WAITING
-READY_TO_DISPATCH_MATCHING
-ALREADY_DISPATCHED
-IGNORED
-```
+Redis здесь используется **только** для быстрой отдачи прогресса в UI и для ускорения проверок Timeout Scanner'ом — не для принятия решения о запуске Matching.
 
 **Но Redis не является источником истины:**
-
-- PostgreSQL — authoritative state
-- Redis AOF `appendfsync everysec` — быстрый кэш/координатор
-- При старте Saga проверяет незавершённые задачи в PostgreSQL
-- Каждая completion-операция сначала защищена PostgreSQL unique constraint
+- PostgreSQL — authoritative state (`task_processing_steps`)
+- Redis AOF `appendfsync everysec` — быстрый кэш
+- При старте Saga-пода состояние синхронизируется из PostgreSQL
 - Redis можно безопасно пересоздать и восстановить
 
 ---
 
-### 📡 Репозитории: Только для агрегатов
-
-Один `TaskRepository`, не отдельные репозитории на каждую таблицу — сохраняет и загружает `Task` целиком как консистентную единицу.
+### 📡 Репозитории: только для агрегатов
 
 ```go
 type TaskRepository interface {
@@ -1508,32 +1581,39 @@ type TaskRepository interface {
 }
 ```
 
+Аналогично для `DocumentRepository`, `VoiceRepository`, `UserRepository`.
+
 ---
 
 ### 🔄 Retry & DLQ политика
 
 | Компонент | Стратегия |
 |-----------|-----------|
-| **OCR Worker** | 3 попытки, интервал 5с → DLQ |
-| **Context Worker** | 3 попытки, интервал 5с → DLQ |
-| **Matching Worker** | 3 попытки, интервал 5с → DLQ |
-| **Voice Worker** | 3 попытки, интервал 5с → DLQ |
-| **Saga Consumer** | 5 попыток, интервал 10с → DLQ (критично для координации) |
+| **OCR Worker** | 3 попытки, интервал 5с → `doc.ocr.dlq` |
+| **Context Worker** | 3 попытки, интервал 5с → `doc.context.dlq` |
+| **Matching Worker** | 3 попытки, интервал 5с → `doc.matching.dlq` |
+| **Voice Worker** | 3 попытки, интервал 5с → `voice.transcribe.dlq` |
+| **Saga (DLQ Consumer)** | 5 попыток на обработку самого DLQ-сообщения, интервал 10с → `saga.dlq` |
+| **Timeout Scanner** | При ошибке запуска — алерт, повтор через 1 минуту (следующий CronJob-тик) |
 | **Notification Relay Consumer** | 3 попытки, затем drop + метрика (не критично для консистентности) |
+| **Compensation Worker** | 3 попытки, интервал 5с → `task.compensation.dlq` |
 | **Outbox Publisher** | Бесконечные ретраи с экспоненциальной задержкой (до 60с) |
 
 **DLQ топики:**
-- `doc.ocr.dlq`
-- `doc.context.dlq`
-- `doc.matching.dlq`
-- `voice.transcribe.dlq`
-- `saga.dlq`
+- `doc.ocr.dlq` — **читается Saga** (детектор сбоя)
+- `doc.context.dlq` — **читается Saga** (детектор сбоя)
+- `doc.matching.dlq` — не гейтит Saga (Matching — терминальный шаг); Matching Worker **сам** переводит задачу в `failed_with_partial_results` и публикует `task.compensation.requested` перед публикацией в DLQ (см. раздел "4.3 Matching-воркеры → Обработка сбоя"); OCR/Context результаты остаются сохранёнными и доступными
+- `voice.transcribe.dlq` — не гейтит ничего (Voice независим)
+- `saga.dlq` — сбои самой Saga при обработке DLQ-сообщений
+- `task.compensation.dlq` — сбои Compensation Worker'а
+
+**Operational DLQ Handling:**
+1. **Мониторинг:** алерт в Slack/PagerDuty через Prometheus при `kafka_dlq_messages_total{topic=~".*dlq"} > 0` в течение 5 минут
+2. **План восстановления:** CLI-инструмент/административный HTTP-эндпоинт с RBAC для просмотра payload и команды `Replay`
 
 ---
 
 ### 📦 Schema Versioning для Kafka
-
-Все сообщения в Kafka имеют версию схемы (Avro/Protobuf + Schema Registry):
 
 ```json
 {
@@ -1559,24 +1639,15 @@ type TaskRepository interface {
 
 ### 📊 OpenTelemetry Tracing
 
-Трейсинг через всю цепочку:
-
 ```
 Gateway (HTTP) → Outbox Relay → Kafka Broker → Worker → PostgreSQL/MinIO → Kafka Consumer (Saga / Notify)
 ```
 
-**Span'ы:**
-- `http.create_task` — входной запрос
-- `outbox.relay` — чтение и публикация из outbox
-- `kafka.produce` — публикация события
-- `kafka.consume` — получение события воркером
-- `worker.process` — обработка (OCR/Context/Matching/Voice)
-- `saga.coordinate` — координация Saga
-- `notify.relay` — трансляция в WebSocket
-- `db.query` — запросы в PostgreSQL
-- `minio.operation` — операции с MinIO
+**Span'ы:** `http.create_task`, `outbox.relay`, `kafka.produce`, `kafka.consume`, `worker.process`, `saga.failure_detect`, `timeout.scan`, `notify.relay`, `db.query`, `minio.operation`
 
 Все span'ы связаны через `trace_id`, передаваемый в заголовках Kafka-сообщений.
+
+**Correlation ID:** все сообщения в Kafka обязаны содержать в заголовках `correlation_id` (= `task_id` для пользовательских задач), что обеспечивает сквозную трассировку и фильтрацию логов по одной задаче.
 
 ---
 
@@ -1586,22 +1657,440 @@ Gateway (HTTP) → Outbox Relay → Kafka Broker → Worker → PostgreSQL/MinIO
 
 | Domain Event | Integration Event | Топик | Кто читает |
 |--------------|-------------------|-------|------------|
-| `TaskCreated` | `TaskCreated` | (internal) | — |
+| `TaskCreated` | — | (internal) | — |
 | `TaskReady` | `doc.ocr.requested` | doc.ocr.requested | OCR Worker |
-| `OCRCompleted` (если нужен Context) | `doc.context.requested` | doc.context.requested | Context Worker |
+| `OCRCompleted` (если Context нужен) | `doc.context.requested` | doc.context.requested | Context Worker |
 | `ContextCompleted` | `doc.matching.requested` | doc.matching.requested | Matching Worker |
-| `TaskReady` | `voice.transcribe.requested` | voice.transcribe.requested | Voice Worker |
-| `OCRCompleted` | `doc.ocr.completed` | doc.ocr.completed | Saga, Notification Relay |
-| `ContextCompleted` | `doc.context.completed` | doc.context.completed | Saga, Notification Relay |
+| `TaskReady` (если Voice включён) | `voice.transcribe.requested` | voice.transcribe.requested | Voice Worker |
+| `OCRCompleted` | `doc.ocr.completed` | doc.ocr.completed | Saga (мониторинг), Notification Relay |
+| `ContextCompleted` | `doc.context.completed` | doc.context.completed | Saga (мониторинг), Notification Relay |
 | `VoiceCompleted` | `voice.transcribe.completed` | voice.transcribe.completed | Notification Relay |
-| `SagaMatchingReady` | `doc.matching.requested` | doc.matching.requested | Matching Worker |
 | `MatchingCompleted` | `doc.matching.completed` | doc.matching.completed | Notification Relay |
+| `OCRFailed` (после retry) | — | doc.ocr.dlq | Saga (сбой) |
+| `ContextFailed` (после retry) | — | doc.context.dlq | Saga (сбой) |
+| `TaskFailed` | `task.compensation.requested` | task.compensation.requested | Compensation Worker |
+
+> Обратите внимание: `doc.matching.requested` встречается в этой таблице **ровно один раз**, с единственным продюсером (`ContextCompleted`) — устранена коллизия с `SagaMatchingReady`, присутствовавшая в предыдущей версии документа.
 
 ---
 
-## Структура шины событий
+## Инфраструктура и Оркестрация
 
-*Здесь будет описание топиков и схем событий*
+### Разделение процессов (Roadmap)
+
+- **MVP (v1.0):** API Gateway, Saga Orchestrator (failure detector), Timeout Scanner, Notification Relay и Outbox Relay объединены в один Deployment (плюс отдельный CronJob для Timeout Scanner) для упрощения развертывания.
+- **Roadmap v2.0:** Выделение `Saga Orchestrator`, `Notification Relay` и `Outbox Relay` в независимые Deployment'ы для независимого масштабирования через KEDA.
+
+### Масштабирование Outbox Relay
+
+Поскольку Outbox Relay читает из PostgreSQL, а не из Kafka, стандартный Kafka Lag Scaler неприменим:
+
+1. **Статическая HA:** фиксированное количество реплик (например, 3 пода) с `SELECT FOR UPDATE SKIP LOCKED`
+2. **KEDA PostgreSQL Scaler (v2.0):** масштабирование на основе `SELECT COUNT(*) FROM outbox_events WHERE status = 'pending'`
+
+### Resource Limits для ML-воркеров
+
+```yaml
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "1"
+  limits:
+    memory: "4Gi" # Базовый лимит; для тяжёлых моделей (напр. Whisper large) — по факту профилирования, может требоваться больше
+    cpu: "2"
+livenessProbe:
+  initialDelaySeconds: 90 # Увеличенная задержка, чтобы K8s не убивал под во время загрузки ML-модели в память при старте
+  periodSeconds: 10
+```
+
+> **Memory limits по моделям:** значение `4Gi` — базовая отправная точка, не универсальная константа. Конкретные лимиты для OCR (Tesseract/EasyOCR) и Voice (Whisper small/medium/large) должны определяться профилированием под реальную нагрузку — модели уровня Whisper large могут требовать существенно больше.
+
+---
+
+## Структура шины событий (Kafka)
+
+Шина событий построена на **Apache Kafka** и обеспечивает асинхронную коммуникацию между компонентами системы. Все события имеют строгую схему (Avro/Protobuf) и версионируются.
+
+### 📋 Топики Kafka
+
+| Топик | Назначение | Producer | Consumer | Retention | Партиции |
+|-------|------------|----------|----------|-----------|----------|
+| `doc.ocr.requested` | Запрос на OCR | Outbox Relay | OCR Worker | 7 дней | 3 |
+| `doc.context.requested` | Запрос на Context | Outbox Relay (от OCR Worker) | Context Worker | 7 дней | 3 |
+| `doc.matching.requested` | Запрос на Matching | Outbox Relay (от Context Worker, единственный источник) | Matching Worker | 7 дней | 3 |
+| `voice.transcribe.requested` | Запрос на транскрибацию | Outbox Relay | Voice Worker | 7 дней | 3 |
+| `doc.ocr.completed` | OCR завершён | OCR Worker | Saga (мониторинг), Notification Relay | 30 дней | 3 |
+| `doc.context.completed` | Context завершён | Context Worker | Saga (мониторинг), Notification Relay | 30 дней | 3 |
+| `doc.matching.completed` | Matching завершён | Matching Worker | Notification Relay | 30 дней | 3 |
+| `voice.transcribe.completed` | Транскрибация завершена | Voice Worker | Notification Relay | 30 дней | 3 |
+| `doc.ocr.dlq` | OCR исчерпал попытки | OCR Worker | **Saga (детектор сбоя)** | 30 дней | 1 |
+| `doc.context.dlq` | Context исчерпал попытки | Context Worker | **Saga (детектор сбоя)** | 30 дней | 1 |
+| `doc.matching.dlq` | Matching исчерпал попытки | Matching Worker | Operational tooling | 30 дней | 1 |
+| `voice.transcribe.dlq` | Voice исчерпал попытки | Voice Worker | Operational tooling | 30 дней | 1 |
+| `task.compensation.requested` | Компенсация при ошибке | Outbox Relay (от FailTaskUseCase) | Compensation Worker | 14 дней | 1 |
+| `file.upload.completed` | Файл загружен | File Service | — (триггер) | 7 дней | 1 |
+
+**DLQ топики второго уровня (операционные сбои самой инфраструктуры обработки ошибок):**
+
+| Топик | Назначение |
+|-------|------------|
+| `saga.dlq` | Сбои Saga при обработке DLQ-сообщений |
+| `task.compensation.dlq` | Сбои Compensation Worker'а |
+
+---
+
+### 📦 Схемы событий
+
+#### 1. doc.ocr.requested
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-123",
+  "event_type": "doc.ocr.requested",
+  "source": "outbox-relay",
+  "timestamp": "2026-08-19T10:30:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "file_id": "file-456",
+    "storage_path": "s3://documents/tenant-456/task-123/original.pdf",
+    "content_type": "application/pdf",
+    "processing_version": 1,
+    "options": {
+      "language": "ru",
+      "dpi": 300
+    }
+  }
+}
+```
+
+#### 2. doc.context.requested
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-124",
+  "event_type": "doc.context.requested",
+  "source": "ocr-worker",
+  "timestamp": "2026-08-19T10:31:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "ocr_result_id": "ocr-789",
+    "file_id": "file-456",
+    "processing_version": 1
+  }
+}
+```
+
+#### 3. doc.matching.requested
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-125",
+  "event_type": "doc.matching.requested",
+  "source": "context-worker",
+  "timestamp": "2026-08-19T10:35:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "document_pd_id": "doc-pd-111",
+    "document_rd_id": "doc-rd-222",
+    "context_result_id": "ctx-789",
+    "processing_version": 1,
+    "options": {
+      "match_threshold": 0.85,
+      "compare_fields": ["text", "tables", "dimensions"]
+    }
+  }
+}
+```
+
+> `source` — `context-worker`, не `saga-orchestrator`: единственный производитель этого события.
+
+#### 4. voice.transcribe.requested
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-126",
+  "event_type": "voice.transcribe.requested",
+  "source": "outbox-relay",
+  "timestamp": "2026-08-19T10:32:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "voice_note_id": "voice-789",
+    "audio_path": "s3://documents/tenant-456/task-123/voice_note.webm",
+    "language": "ru",
+    "options": {
+      "speaker_diarization": true,
+      "timestamps": true
+    }
+  }
+}
+```
+
+#### 5. doc.ocr.completed
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-127",
+  "event_type": "doc.ocr.completed",
+  "source": "ocr-worker",
+  "timestamp": "2026-08-19T10:33:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "file_id": "file-456",
+    "status": "success",
+    "ocr_result_id": "ocr-789",
+    "processing_version": 1,
+    "metrics": {
+      "duration_ms": 15000,
+      "pages_processed": 10
+    }
+  }
+}
+```
+
+#### 6. doc.context.completed
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-128",
+  "event_type": "doc.context.completed",
+  "source": "context-worker",
+  "timestamp": "2026-08-19T10:34:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "status": "success",
+    "context_result_id": "ctx-789",
+    "processing_version": 1,
+    "entities_extracted": 42
+  }
+}
+```
+
+#### 7. doc.matching.completed
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-129",
+  "event_type": "doc.matching.completed",
+  "source": "matching-worker",
+  "timestamp": "2026-08-19T10:38:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "status": "success",
+    "protocol_id": "proto-789",
+    "discrepancies_found": 5,
+    "processing_version": 1
+  }
+}
+```
+
+#### 8. voice.transcribe.completed
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-130",
+  "event_type": "voice.transcribe.completed",
+  "source": "voice-worker",
+  "timestamp": "2026-08-19T10:36:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "voice_note_id": "voice-789",
+    "status": "success",
+    "transcript": "Полный текст транскрипции...",
+    "language": "ru",
+    "confidence": 0.92,
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 2.5,
+        "text": "Первое замечание по чертежу...",
+        "speaker": "1"
+      }
+    ]
+  }
+}
+```
+
+#### 9. doc.ocr.dlq / doc.context.dlq
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-133",
+  "event_type": "dlq.message",
+  "source": "ocr-worker",
+  "timestamp": "2026-08-19T10:40:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "original_topic": "doc.ocr.requested",
+    "original_event": {
+      "event_id": "evt-123",
+      "event_type": "doc.ocr.requested"
+    },
+    "error": {
+      "code": "OCR_FAILED",
+      "message": "Tesseract timeout after 60 seconds",
+      "retry_count": 3,
+      "timestamp": "2026-08-19T10:40:00Z"
+    }
+  }
+}
+```
+
+> Читается **Saga Orchestrator'ом** — единственный сигнал немедленного сбоя, ведущий к `FailTaskUseCase`.
+
+#### 10. task.compensation.requested
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-131",
+  "event_type": "task.compensation.requested",
+  "source": "fail-task-usecase",
+  "timestamp": "2026-08-19T10:41:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "task_id": "task-123",
+    "reason": "OCR failed after 3 retries",
+    "failed_step": "ocr",
+    "detected_via": "dlq",
+    "cleanup_actions": [
+      {
+        "type": "delete_temporary_files",
+        "paths": ["s3://documents/tenant-456/task-123/temp/"]
+      }
+    ]
+  }
+}
+```
+
+#### 11. file.upload.completed
+
+```json
+{
+  "schema_version": "v1",
+  "event_id": "evt-132",
+  "event_type": "file.upload.completed",
+  "source": "file-service",
+  "timestamp": "2026-08-19T10:29:00Z",
+  "correlation_id": "task-123",
+  "tenant_id": "tenant-456",
+  "data": {
+    "file_id": "file-456",
+    "task_id": "task-123",
+    "storage_path": "s3://documents/tenant-456/task-123/original.pdf",
+    "file_size_bytes": 2048576,
+    "checksum": "3b7a3f8e4c2d9a1f...",
+    "content_type": "application/pdf"
+  }
+}
+```
+
+---
+
+### ⚙️ Конфигурация Kafka
+
+#### Producer Configuration
+
+```yaml
+kafka:
+  producer:
+    acks: all
+    retries: 5
+    compression_type: snappy
+    batch_size: 16384
+    linger_ms: 10
+    enable_idempotence: true
+    max_in_flight_requests_per_connection: 5
+    request_timeout_ms: 30000
+```
+
+#### Consumer Configuration
+
+```yaml
+kafka:
+  consumer:
+    group:
+      saga_monitor: saga-orchestrator-monitor      # doc.ocr.completed, doc.context.completed
+      saga_failure: saga-orchestrator-failure       # doc.ocr.dlq, doc.context.dlq
+      notify: notification-relay
+      ocr: ocr-worker
+      context: context-worker
+      matching: matching-worker
+      voice: voice-worker
+      compensation: compensation-worker
+    config:
+      enable_auto_commit: false
+      auto_offset_reset: earliest
+      max_poll_records: 100
+      fetch_max_bytes: 52428800
+      session_timeout_ms: 30000
+      heartbeat_interval_ms: 3000
+```
+
+> **Timeout Scanner не является Kafka-consumer'ом** — это отдельный CronJob, работающий напрямую с PostgreSQL и не имеющий consumer-группы.
+
+---
+
+### 🚀 Schema Registry
+
+```yaml
+schema_registry:
+  url: http://schema-registry:8081
+  compatibility: backward
+  timeout: 10s
+```
+
+| Версия | Добавлено | Изменения |
+|--------|-----------|-----------|
+| v1 | 2026-08-19 | Initial release |
+| v2 | — | Добавлено поле `metrics` в completion-события |
+
+---
+
+### 📊 Мониторинг и Алертинг
+
+| Метрика | Описание | Alert |
+|---------|----------|-------|
+| `kafka_topic_messages_total` | Количество сообщений в топике | — |
+| `kafka_consumer_lag` | Отставание consumer'а | > 1000 сообщений в течение 5 минут |
+| `kafka_dlq_messages_total` | Сообщения в DLQ | > 0 в течение 5 минут |
+| `outbox_pending_count` | Нераспубликованные outbox-события | > 100 в течение 5 минут |
+| `kafka_producer_errors_total` | Ошибки producer'а | > 0 |
+| `task_processing_steps_stuck_count` | Кол-во шагов, зависших дольше порога (найдено Timeout Scanner'ом) | > 0 в течение 5 минут |
+
+**Реакция:**
+1. **DLQ не пустой > 5 минут** → оповещение в Slack
+2. **Consumer Lag > 1000** → автомасштабирование через KEDA
+3. **Outbox Pending > 100** → автомасштабирование Outbox Relay через KEDA PostgreSQL Scaler
+4. **Timeout Scanner нашёл зависшие шаги** → оповещение + автоматический вызов `FailTaskUseCase`
+
+---
 
 ## Структура воркеров
 
