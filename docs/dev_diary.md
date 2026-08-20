@@ -60,9 +60,6 @@ Plans for 20-21.08.2026:
         Проверить порядок колонок в индексе outbox_pending_idx. Рекомендуется (status, available_at, created_at) для оптимальной работы с SKIP LOCKED.
     Identity Context:
         Добавить пометку, что UserRepository реализован как порт, что позволит в будущем заменить in-process реализацию на gRPC-клиент без изменения Domain-слоя.
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
 
 # 20.08.2026
 Changes:
@@ -73,4 +70,3 @@ plans for 21-23.08.2026:
 1. Complete arch docs (MVP, changes in process of developing)
 2. Start writing API gateway
 3. Adapting of service code from previos project to EDA patterns. Adding K8s-compatability.
->>>>>>> Stashed changes
