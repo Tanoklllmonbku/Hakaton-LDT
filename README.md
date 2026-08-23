@@ -250,9 +250,29 @@ curl -X POST https://api.doccontrol.example.com/v1/tasks \
 
 ---
 
-#### 📥 Ответ
+#### 📥 Ответ (фаза `create`)
 
-Задача создана и поставлена в обработку — результат ещё не готов:
+Задача создана, ожидает загрузки файла:
+
+```json
+{
+  "task_id": "task_7f3a",
+  "status": "accepted",
+  "upload_url": "https://minio.example.com/presigned/upload/..."
+}
+```
+
+#### 📤 Подтверждение загрузки (фаза `confirm_upload`)
+
+```bash
+curl -X POST https://api.doccontrol.example.com/v1/tasks   -H "Authorization: Bearer <token>"   -H "Content-Type: application/json"   -H "Idempotency-Key: 3f7a9c2e-..."   -d '{
+    "operation": "confirm_upload",
+    "task_id": "task_7f3a",
+    "files": [{"file_id": "file_456", "etag": ""abc123""}]
+  }'
+```
+
+#### 📥 Ответ (фаза `confirm_upload`)
 
 ```json
 {

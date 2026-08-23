@@ -70,3 +70,10 @@ plans for 21-23.08.2026:
 1. Complete arch docs (MVP, changes in process of developing)
 2. Start writing API gateway
 3. Adapting of service code from previos project to EDA patterns. Adding K8s-compatability.
+
+# 23.08.2026
+Changes:
+1. MVP version of arch doc (docs/arch.md)
+2. Final README
+3. Start of Gateway (Fork by Kaiman30)
+4. Analyzed repository with core of ML services (Work with ML will be started 24.08.2026)

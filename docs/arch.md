@@ -138,8 +138,8 @@ graph TB
     K8 --> NOTIFY
     NOTIFY -->|WebSocket push| FE
 
-    %% File Upload триггер
-    K9 -->|триггер| K1
+    %% File Upload событие — используется для аудита/уведомлений,
+    %% не триггерит OCR напрямую (OCR запускается через Outbox после confirm_upload)
 
     %% Оркестрация
     K8s -.->|Deployment/HPA| GW
@@ -464,7 +464,7 @@ sequenceDiagram
     end
 
     GW->>PG: INSERT task (status='accepted')
-    GW-->>FE: 200 OK {task_id, upload_url, status: "awaiting_upload"}
+    GW-->>FE: 200 OK {task_id, upload_url, status: "accepted"}
 
     Note over FE,M: 2. ЗАГРУЗКА ФАЙЛА
 
@@ -487,7 +487,7 @@ sequenceDiagram
     GW->>GW: Определить какие события нужны
     Note over GW: зависит от task_type и process
 
-    GW->>PG: Транзакция:<br>UPDATE task status='processing'<br>+ INSERT task_processing_steps (ожидаемые шаги: ocr, context — для Timeout Scanner)<br>+ INSERT outbox_events (doc.ocr.requested)<br>+ INSERT outbox_events (voice.transcribe.requested если включён)
+    GW->>PG: Транзакция:<br>UPDATE task status='processing'<br>+ INSERT task_processing_steps (step='ocr', status='requested', started_at=now())<br>+ INSERT task_processing_steps (step='context', status='requested', started_at=now()) если context нужен<br>+ INSERT outbox_events (doc.ocr.requested)<br>+ INSERT outbox_events (voice.transcribe.requested если включён)
 
     Note over GW: Context и Matching НЕ публикуются здесь!<br>Каждый следующий шаг триггерит предыдущий воркер
 
@@ -523,7 +523,7 @@ sequenceDiagram
         CTX->>CTX: Context обработка
 
         alt Успех
-            CTX->>PG: Транзакция:<br>+ INSERT consumed_events (context-worker, event_id)<br>+ INSERT context_results (task_id)<br>+ UPDATE task_processing_steps SET status='completed' WHERE step='context'<br>+ INSERT saga_commands (matching_trigger) ON CONFLICT DO NOTHING<br>+ INSERT outbox_events (doc.matching.requested)<br>+ COMMIT
+            CTX->>PG: Транзакция:<br>+ UPDATE task_processing_steps SET status='running', started_at=now() WHERE step='context' AND status='requested'<br>... Context обработка ...<br>+ INSERT consumed_events (context-worker, event_id)<br>+ INSERT context_results (task_id)<br>+ UPDATE task_processing_steps SET status='completed' WHERE step='context'<br>+ INSERT saga_commands (matching_trigger) ON CONFLICT DO NOTHING<br>+ INSERT outbox_events (doc.matching.requested)<br>+ COMMIT
             Note over CTX,PG: Context Worker — ЕДИНСТВЕННЫЙ владелец<br>триггера doc.matching.requested
             CTX->>K: doc.context.completed
         else Ошибка после 3 попыток
@@ -1479,10 +1479,7 @@ ON CONFLICT DO NOTHING;
 **Дополнительная защита бизнес-ключом:**
 
 ```sql
-CREATE UNIQUE INDEX ocr_result_once_idx ON ocr_results (task_id, processing_version);
-CREATE UNIQUE INDEX context_result_once_idx ON context_results (task_id, processing_version);
-CREATE UNIQUE INDEX matching_result_once_idx ON discrepancies (task_id, processing_version);
-CREATE UNIQUE INDEX voice_result_once_idx ON voice_results (task_id, voice_id);
+-- Уникальные индексы определены как CONSTRAINT UNIQUE в CREATE TABLE выше
 ```
 
 ---
@@ -1552,7 +1549,7 @@ saga:{task_id}
 {
   "schema_version": 1,
   "task_id": "task-123",
-  "process_version": 1,
+  "processing_version": 1,
   "expected": ["ocr", "context"],
   "completed": ["ocr"],
   "failed": [],
@@ -2297,7 +2294,7 @@ CREATE TABLE tasks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
-        'pending', 'accepted', 'ready', 'processing',
+        'pending', 'accepted', 'awaiting_upload', 'ready', 'processing',
         'completed', 'failed', 'failed_with_partial_results'
     )),
     task_type TEXT NOT NULL,
@@ -2366,11 +2363,64 @@ CREATE TABLE saga_commands (
     UNIQUE (task_id, command_type)  -- критичный constraint против гонки DLQ/Timeout
 );
 
+-- 5.5. Таблицы результатов обработки (определяются здесь для полноты архитектурной схемы;
+-- в проде могут управляться миграциями соответствующих сервисов)
+CREATE TABLE ocr_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    processing_version INTEGER NOT NULL DEFAULT 1,
+    file_id UUID NOT NULL,
+    recognized_text TEXT,
+    extracted_tables JSONB,
+    page_count INTEGER,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, processing_version)
+);
+CREATE INDEX idx_ocr_results_task ON ocr_results(task_id);
+
+CREATE TABLE context_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    processing_version INTEGER NOT NULL DEFAULT 1,
+    entities JSONB,
+    sections JSONB,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, processing_version)
+);
+CREATE INDEX idx_context_results_task ON context_results(task_id);
+
+CREATE TABLE voice_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    voice_id UUID NOT NULL,
+    transcript TEXT,
+    language TEXT,
+    confidence NUMERIC(3,2),
+    segments JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, voice_id)
+);
+CREATE INDEX idx_voice_results_task ON voice_results(task_id);
+
+CREATE TABLE discrepancies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    processing_version INTEGER NOT NULL DEFAULT 1,
+    protocol_id UUID,
+    severity TEXT NOT NULL CHECK (severity IN ('critical', 'major', 'minor', 'info')),
+    description TEXT NOT NULL,
+    location JSONB,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, processing_version)
+);
+CREATE INDEX idx_discrepancies_task ON discrepancies(task_id);
+CREATE INDEX idx_discrepancies_protocol ON discrepancies(protocol_id);
+
 -- 6. Идемпотентность и уникальность бизнес-результатов по версии обработки
-CREATE UNIQUE INDEX ocr_result_once_idx ON ocr_results (task_id, processing_version);
-CREATE UNIQUE INDEX context_result_once_idx ON context_results (task_id, processing_version);
-CREATE UNIQUE INDEX matching_result_once_idx ON discrepancies (task_id, processing_version);
-CREATE UNIQUE INDEX voice_result_once_idx ON voice_results (task_id, voice_id);
+-- Уникальные индексы определены как CONSTRAINT UNIQUE в CREATE TABLE выше
 
 -- 7. Идемпотентность на уровне API Gateway (Transport Layer)
 CREATE TABLE idempotency_keys (
@@ -2545,6 +2595,14 @@ spec:
         ports:
         - containerPort: 8080   # HTTP/REST
         - containerPort: 8081   # WebSocket (Notification Relay)
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster.kafka:9092"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef: { name: db-credentials, key: url }
+        # В этом же поде работают Saga Orchestrator (consumer группы saga_monitor/saga_failure)
+        # и Notification Relay (consumer группа notify) — см. раздел API Gateway
         resources:
           requests: { memory: "512Mi", cpu: "500m" }
           limits: { memory: "1Gi", cpu: "1" }
