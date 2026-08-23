@@ -77,3 +77,7 @@ Changes:
 2. Final README
 3. Start of Gateway (Fork by Kaiman30)
 4. Analyzed repository with core of ML services (Work with ML will be started 24.08.2026)
+
+Plans for 24.08.2026:
+1. Rewrite Core of services (Clean the code, add outbox and etc.)
+2. Create GiTea + project WIKI + start task managing of project
