@@ -2094,12 +2094,486 @@ schema_registry:
 
 ## Структура воркеров
 
-*Здесь будет детальное описание каждого воркера*
+> **Архитектурное решение:** воркеры разделены на **Core** (переиспользуемое ядро — Kafka consumer/producer, PostgreSQL-транзакции, идемпотентность, Outbox-хелперы, трейсинг, graceful shutdown) и **BL-сервисы** (OCR, Context, Matching, Voice, Compensation), которые зависят от Core как от версионированного пакета и содержат **только бизнес-логику**. Это устраняет дублирование инфраструктурного кода между пятью Python-сервисами и позволяет чинить баги идемпотентности/транзакционности в одном месте.
+
+### 6.1. Core — переиспользуемое ядро воркера
+
+**Ключевое решение по деплойменту:** Core — это **не отдельный K8s-под и не отдельный сетевой сервис**, а **отдельно версионируемый и релизимый пакет** (собственный git-репозиторий `worker-core`, собственный CI/CD, публикация в приватный PyPI-индекс, например Artifactory/Nexus/GitLab Package Registry). "Развёртывание отдельно" означает: у Core свой релизный цикл (semver, changelog, независимые тесты), и BL-сервисы обновляют версию Core как обычную зависимость (`worker-core==1.4.2` в `requirements.txt`/`pyproject.toml`), а не автоматически при каждом релизе Core. Это даёт изоляцию: обновление Core не разворачивает само себя по сети — оно попадает в каждый BL-сервис через собственный Docker-билд этого сервиса при осознанном bump'е версии.
+
+**Структура репозитория `worker-core`:**
+
+```
+worker-core/
+├── worker_core/
+│   ├── __init__.py
+│   ├── config.py            # чтение ENV, DATABASE_URL, KAFKA_BROKERS и т.д.
+│   ├── kafka/
+│   │   ├── consumer.py      # обёртка над confluent_kafka.Consumer, manual commit
+│   │   ├── producer.py      # обёртка над confluent_kafka.Producer, idempotent producer
+│   │   └── headers.py       # извлечение/проброс correlation_id, trace_id
+│   ├── db/
+│   │   ├── engine.py        # SQLAlchemy engine + connection pool
+│   │   └── transaction.py   # transactional() контекстный менеджер
+│   ├── idempotency.py       # consumed_events: claim_once(), already_processed()
+│   ├── outbox.py            # write_outbox_event() — helper для INSERT в outbox_events
+│   ├── tracing.py           # OpenTelemetry span'ы: kafka.consume, worker.process, db.query
+│   ├── lifecycle.py         # graceful shutdown по SIGTERM, health/readiness эндпоинты
+│   ├── logging.py           # structlog-конфигурация с correlation_id в контексте
+│   └── base_worker.py       # BaseWorker — шаблонный метод run() + process_message()
+├── tests/
+├── pyproject.toml           # версия пакета (semver), публикуется в CI
+└── CHANGELOG.md
+```
+
+**`base_worker.py` — шаблонный метод, вокруг которого строятся все BL-сервисы:**
+
+```python
+# worker_core/base_worker.py
+import signal
+from contextlib import contextmanager
+from worker_core.kafka.consumer import KafkaConsumerWrapper
+from worker_core.kafka.producer import KafkaProducerWrapper
+from worker_core.db.engine import make_engine
+from worker_core.idempotency import already_processed, claim_event
+from worker_core.tracing import traced_span
+from worker_core.logging import get_logger, bind_correlation_id
+
+logger = get_logger()
+
+class BaseWorker:
+    """
+    Инкапсулирует всю инфраструктурную часть: подписку на топик, ручной
+    commit офсетов только после успешной транзакции, идемпотентность,
+    graceful shutdown, трейсинг и логирование с correlation_id.
+
+    BL-сервисы наследуются от BaseWorker и переопределяют ТОЛЬКО
+    handle(self, conn, event) — бизнес-логику внутри уже открытой
+    PostgreSQL-транзакции.
+    """
+
+    consumer_name: str = None   # переопределяется в наследнике, напр. 'ocr-worker'
+    topic: str = None           # переопределяется в наследнике
+
+    def __init__(self):
+        assert self.consumer_name and self.topic, "consumer_name/topic обязательны"
+        self.consumer = KafkaConsumerWrapper(topic=self.topic, group_id=self.consumer_name)
+        self.producer = KafkaProducerWrapper()
+        self.engine = make_engine()
+        self._running = True
+        signal.signal(signal.SIGTERM, self._on_sigterm)
+
+    def _on_sigterm(self, *_):
+        logger.info("SIGTERM received, finishing in-flight message then stopping")
+        self._running = False
+
+    @contextmanager
+    def _transaction(self):
+        with self.engine.begin() as conn:
+            yield conn
+
+    def run(self):
+        logger.info("worker.started", topic=self.topic, consumer=self.consumer_name)
+        while self._running:
+            msg = self.consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+
+            with bind_correlation_id(msg), traced_span("worker.process", topic=self.topic):
+                event_id = msg.event_id()
+                with self._transaction() as conn:
+                    if already_processed(conn, self.consumer_name, event_id):
+                        logger.info("event.duplicate_skipped", event_id=event_id)
+                    else:
+                        claim_event(conn, self.consumer_name, event_id)
+                        self.handle(conn, msg.event())   # <-- ТОЛЬКО ЭТО пишет BL-сервис
+                self.consumer.commit(msg)  # ack только после COMMIT транзакции
+
+    def handle(self, conn, event: dict):
+        """Переопределяется в BL-сервисе. Вызывается ВНУТРИ открытой транзакции conn."""
+        raise NotImplementedError
+```
+
+**Что Core берёт на себя (и BL-сервис никогда не пишет заново):**
+- Ручной `commit()` офсета Kafka только после успешного `COMMIT` PostgreSQL-транзакции (at-least-once → effectively-once)
+- Проверку и запись в `consumed_events` (идемпотентность) — до вызова `handle()`
+- Graceful shutdown по `SIGTERM` — дописывает текущее сообщение, не берёт новое
+- `correlation_id`/`trace_id` из заголовков Kafka — прокидывается в structlog и OpenTelemetry span автоматически
+- Connection pooling (SQLAlchemy `pool_size`/`max_overflow`)
+- `/health` и `/ready` HTTP-эндпоинты для `livenessProbe`/`readinessProbe`
+
+---
+
+### 6.2. BL-сервисы — только бизнес-логика поверх Core
+
+Каждый BL-сервис — тонкий пакет, зависящий от `worker-core` как от библиотеки. Пример — OCR-воркер:
+
+```python
+# ocr_worker/main.py
+from worker_core.base_worker import BaseWorker
+from worker_core.outbox import write_outbox_event
+from ocr_worker.ocr_engine import run_ocr           # собственная BL: Tesseract/EasyOCR
+from ocr_worker.repository import save_ocr_result   # собственная BL: INSERT ocr_results
+
+class OCRWorker(BaseWorker):
+    consumer_name = "ocr-worker"
+    topic = "doc.ocr.requested"
+
+    def handle(self, conn, event: dict):
+        task_id = event["data"]["task_id"]
+        storage_path = event["data"]["storage_path"]
+        processing_version = event["data"]["processing_version"]
+
+        ocr_result = run_ocr(storage_path, options=event["data"].get("options", {}))
+        save_ocr_result(conn, task_id, processing_version, ocr_result)
+
+        conn.execute(
+            "UPDATE task_processing_steps SET status='completed', completed_at=now() "
+            "WHERE task_id=:task_id AND step='ocr'",
+            {"task_id": task_id},
+        )
+
+        context_needed = event["data"].get("context_needed", True)
+        if context_needed:
+            write_outbox_event(conn, event_type="doc.context.requested",
+                                aggregate_id=task_id, payload={"task_id": task_id, "ocr_result_id": ocr_result.id})
+        else:
+            write_outbox_event(conn, event_type="doc.matching.requested",
+                                aggregate_id=task_id, payload={"task_id": task_id})
+            conn.execute(
+                "UPDATE task_processing_steps SET status='skipped', completed_at=now() "
+                "WHERE task_id=:task_id AND step='context'",
+                {"task_id": task_id},
+            )
+
+if __name__ == "__main__":
+    OCRWorker().run()
+```
+
+Обратите внимание: `main.py` OCR-воркера **не содержит** ни строчки про Kafka-подписку, ручной commit, идемпотентность или SIGTERM — весь этот код живёт в `worker-core` и переиспользуется без изменений в Context/Matching/Voice/Compensation-воркерах. BL-сервис отвечает только за то, что уникально для него: вызов `run_ocr()`, сохранение результата и решение "нужен ли Context" (ветвление из раздела 4.1).
+
+**Аналогично устроены:**
+- `context_worker/main.py` — наследует `BaseWorker`, `handle()` вызывает NER-модель и пишет `doc.matching.requested` (единственный владелец триггера, см. раздел "4.2 Context-воркеры")
+- `matching_worker/main.py` — наследует `BaseWorker`, `handle()` вызывает сопоставление; при 3 неудачных `handle()` (перехватывается в Core через retry-декоратор) публикует в `doc.matching.dlq` и сам переводит задачу в `failed_with_partial_results` (см. раздел "4.3 Matching-воркеры → Обработка сбоя")
+- `voice_worker/main.py` — наследует `BaseWorker`, независимый топик, не пишет в `task_processing_steps` вообще
+- `compensation_worker/main.py` — наследует `BaseWorker`, `handle()` удаляет объекты в MinIO, трактуя `404/NoSuchKey` как успех (см. раздел "4.5 Compensation Worker")
+
+**Retry/DLQ как часть Core, не BL:** декоратор `@with_retry(max_attempts=3, backoff_seconds=5, dlq_topic=...)` реализован в `worker_core.retry` и применяется поверх `handle()` через конфигурацию в наследнике, а не переписывается в каждом BL-сервисе:
+
+```python
+class OCRWorker(BaseWorker):
+    consumer_name = "ocr-worker"
+    topic = "doc.ocr.requested"
+    retry_config = RetryConfig(max_attempts=3, backoff_seconds=5, dlq_topic="doc.ocr.dlq")
+
+    def handle(self, conn, event: dict):
+        ...
+```
+
+### 6.3. Versioning и релизный цикл Core
+
+| Событие | Действие |
+|---------|----------|
+| Багфикс в `worker_core.idempotency` | Патч-релиз `worker-core` (semver `1.4.2 → 1.4.3`), публикация в приватный PyPI |
+| BL-сервис хочет получить фикс | Разработчик поднимает pin в `pyproject.toml` этого сервиса, пересобирает Docker-образ, катит через обычный CI/CD сервиса |
+| Breaking change в API `BaseWorker` | Мажорный релиз (`2.0.0`), миграция BL-сервисов — по графику, не одновременно, каждый сервис независимо |
+
+Так Core обновляется предсказуемо и не может "уронить" все пять сервисов одновременным изменением поведения — в отличие от сценария, где общий код жил бы как shared-модуль в монорепо без версионирования.
+
+### 6.4. Наблюдаемость и жизненный цикл (обеспечивается Core для всех BL-сервисов)
+
+- **Structured logging** — все логи включают `correlation_id` и `event_id`, что позволяет отследить путь сообщения через все сервисы в Grafana Loki/ELK одним фильтром
+- **OpenTelemetry** — Core оборачивает `handle()` в span `worker.process`, дочерние `db.query`/`kafka.produce` span'ы наследуют `trace_id` (см. раздел "OpenTelemetry Tracing" backend-части)
+- **Graceful Shutdown** — при `SIGTERM` (масштабирование вниз через HPA/KEDA, rolling update) воркер дописывает текущее сообщение, коммитит транзакцию и офсет, и только затем завершает процесс — задачи не теряются при деплое
+
+---
 
 ## Структура хранилищ
 
-*Здесь будет описание схем БД и структур хранения*
+Ниже приведены итоговые DDL-скрипты, реализующие все гарантии идемпотентности, изоляции и производительности, описанные в разделах выше.
+
+```sql
+-- 1. Основная таблица задач (multi-tenancy, включая failed_with_partial_results)
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'accepted', 'ready', 'processing',
+        'completed', 'failed', 'failed_with_partial_results'
+    )),
+    task_type TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_tasks_tenant_status ON tasks(tenant_id, status);
+
+-- 2. Outbox (SKIP LOCKED-оптимизированный индекс)
+CREATE TABLE outbox_events (
+    event_id UUID PRIMARY KEY,
+    aggregate_id UUID NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    schema_version SMALLINT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'publishing', 'published', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    locked_at TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_outbox_pending_scan ON outbox_events (status, available_at, created_at)
+WHERE status IN ('pending', 'publishing', 'failed');
+
+-- 3. Идемпотентность consumer'ов (реализуется через worker_core.idempotency)
+CREATE TABLE consumed_events (
+    consumer_name TEXT NOT NULL,
+    event_id UUID NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer_name, event_id)
+);
+
+-- 4. Шаги обработки (только 'ocr'/'context' — используется Timeout Scanner'ом)
+CREATE TABLE task_processing_steps (
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    step TEXT NOT NULL CHECK (step IN ('ocr', 'context')),
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'requested', 'running', 'completed', 'skipped', 'failed'
+    )),
+    attempt INTEGER NOT NULL DEFAULT 0,
+    event_id UUID,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    failed_at TIMESTAMPTZ,
+    error_code TEXT,
+    error_message TEXT,
+    PRIMARY KEY (task_id, step)
+);
+CREATE INDEX idx_steps_timeout_scan ON task_processing_steps (status, started_at)
+WHERE status IN ('requested', 'running');
+
+-- 5. Команды Saga (защита от двойной компенсации: DLQ vs Timeout Scanner)
+CREATE TABLE saga_commands (
+    command_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    command_type TEXT NOT NULL,   -- 'task.compensation.requested'
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ,
+    last_error TEXT,
+    UNIQUE (task_id, command_type)  -- критичный constraint против гонки DLQ/Timeout
+);
+
+-- 6. Идемпотентность и уникальность бизнес-результатов по версии обработки
+CREATE UNIQUE INDEX ocr_result_once_idx ON ocr_results (task_id, processing_version);
+CREATE UNIQUE INDEX context_result_once_idx ON context_results (task_id, processing_version);
+CREATE UNIQUE INDEX matching_result_once_idx ON discrepancies (task_id, processing_version);
+CREATE UNIQUE INDEX voice_result_once_idx ON voice_results (task_id, voice_id);
+
+-- 7. Идемпотентность на уровне API Gateway (Transport Layer)
+CREATE TABLE idempotency_keys (
+    key TEXT PRIMARY KEY,
+    task_id UUID,
+    response_payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL  -- created_at + 24 часа, см. раздел Transport Layer
+);
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+```
+
+**Владение таблицами по слоям:**
+
+| Таблица | Кто пишет | Кто читает |
+|---------|-----------|------------|
+| `tasks` | Application Layer (CreateTaskUseCase, FailTaskUseCase) | Все Query'и, Timeout Scanner (косвенно через `task_processing_steps`) |
+| `outbox_events` | Любой компонент, публикующий событие (через `worker_core.outbox`) | Outbox Relay |
+| `consumed_events` | Каждый BL-воркер (через `worker_core.idempotency`) | Тот же воркер (проверка перед `handle()`) |
+| `task_processing_steps` | OCR/Context Worker, Saga (мониторинг) | Timeout Scanner |
+| `saga_commands` | FailTaskUseCase (через Saga) | — (audit/защита от дублей) |
+| `idempotency_keys` | Transport Middleware | Transport Middleware |
+
+---
 
 ## Структура системы оркестрации
 
-*Здесь будет описание Kubernetes манифестов и конфигураций*
+Ниже — ключевые Kubernetes-манифесты, реализующие описанные стратегии масштабирования и отказоустойчивости. BL-сервисы — тонкие Docker-образы, в которые `worker-core` устанавливается как зафиксированная версия зависимости на этапе сборки (не разворачивается как отдельный workload).
+
+### 8.1. Dockerfile BL-сервиса (иллюстрация того, как Core попадает в образ)
+
+```dockerfile
+# ocr_worker/Dockerfile
+FROM python:3.12-slim AS base
+WORKDIR /app
+
+# worker-core подтягивается из приватного индекса как обычная зависимость,
+# версия зафиксирована в pyproject.toml — никакого сетевого вызова к Core в рантайме
+COPY pyproject.toml poetry.lock ./
+RUN pip install poetry && poetry export -f requirements.txt | pip install -r /dev/stdin
+
+COPY ocr_worker/ ./ocr_worker/
+CMD ["python", "-m", "ocr_worker.main"]
+```
+
+### 8.2. ML-воркер (OCR) — Deployment + KEDA ScaledObject
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocr-worker
+  labels:
+    app: ocr-worker
+    worker-core-version: "1.4.3"   # для быстрого аудита, какая версия Core в проде
+spec:
+  replicas: 1   # базовая реплика, масштабированием управляет KEDA
+  template:
+    spec:
+      containers:
+      - name: ocr-worker
+        image: myregistry/ocr-worker:v1.2.0
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef: { name: db-credentials, key: url }
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster.kafka:9092"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"   # базовый ориентир; для тяжёлых ML-моделей — по профилированию
+            cpu: "2"
+        livenessProbe:
+          httpGet: { path: /health, port: 8080 }   # эндпоинт из worker_core.lifecycle
+          initialDelaySeconds: 90    # время на загрузку ML-модели в память
+          periodSeconds: 15
+        readinessProbe:
+          httpGet: { path: /ready, port: 8080 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ocr-worker-scaler
+spec:
+  scaleTargetRef:
+    name: ocr-worker
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-cluster.kafka:9092
+      consumerGroup: ocr-worker
+      topic: doc.ocr.requested
+      lagThreshold: "50"
+      offsetResetPolicy: earliest
+```
+
+Аналогичная пара `Deployment + ScaledObject` заводится для `context-worker` (топик `doc.context.requested`), `matching-worker` (`doc.matching.requested`), `voice-worker` (`voice.transcribe.requested`) и `compensation-worker` (`task.compensation.requested`) — конфигурация отличается только образом, топиком и `lagThreshold`.
+
+### 8.3. Timeout Scanner (CronJob)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: timeout-scanner
+spec:
+  schedule: "*/1 * * * *"          # каждую минуту
+  concurrencyPolicy: Forbid        # запрет параллельных запусков — исключает гонку
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: scanner
+            image: myregistry/timeout-scanner:v1.0.0
+            env:
+            - name: TIMEOUT_THRESHOLD_MINUTES
+              value: "15"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: url }
+```
+
+> Timeout Scanner **не наследует** `BaseWorker` из Core — он не Kafka-consumer, а прямой polling-джоб над PostgreSQL (см. раздел Saga Orchestrator). Использует только `worker_core.db` для подключения к PostgreSQL, но не `worker_core.kafka`.
+
+### 8.4. Outbox Relay (несколько реплик, SKIP LOCKED)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-relay
+spec:
+  replicas: 3   # фиксированное количество реплик для HA (см. раздел Outbox Pattern)
+  template:
+    spec:
+      containers:
+      - name: relay
+        image: myregistry/outbox-relay:v1.0.0
+        env:
+        - name: BATCH_SIZE
+          value: "100"
+        - name: POLL_INTERVAL_MS
+          value: "500"
+        resources:
+          requests: { memory: "256Mi", cpu: "100m" }
+          limits: { memory: "512Mi", cpu: "500m" }
+```
+
+### 8.5. API Gateway (HTTP + Saga failure-detector + Notification Relay)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: gateway
+        image: myregistry/api-gateway:v1.0.0
+        ports:
+        - containerPort: 8080   # HTTP/REST
+        - containerPort: 8081   # WebSocket (Notification Relay)
+        resources:
+          requests: { memory: "512Mi", cpu: "500m" }
+          limits: { memory: "1Gi", cpu: "1" }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 70 }
+```
+
+### 8.6. Сводная таблица деплоймента
+
+| Компонент | Тип ресурса | Источник Core | Масштабирование |
+|-----------|-------------|----------------|------------------|
+| **API Gateway** (HTTP + Saga + Notify) | Deployment | Go, свой рантайм (не Python Core) | HPA по CPU |
+| **OCR / Context / Matching / Voice Worker** | Deployment | `worker-core` как pip-зависимость в образе | KEDA по Kafka lag |
+| **Compensation Worker** | Deployment | `worker-core` как pip-зависимость | KEDA по Kafka lag |
+| **Outbox Relay** | Deployment | Собственный минимальный рантайм (не наследует BaseWorker — не consumer, а polling+producer) | Статические 3 реплики (v1.0), KEDA PostgreSQL Scaler (v2.0) |
+| **Timeout Scanner** | CronJob | `worker_core.db` (без Kafka-части Core) | Не масштабируется — раз в минуту, `concurrencyPolicy: Forbid` |
+| **Kafka / PostgreSQL / MinIO / Redis** | StatefulSet | — | Согласно разделу "Оркестрация (Kubernetes)" в начале документа |
