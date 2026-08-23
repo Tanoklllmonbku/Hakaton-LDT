@@ -6,12 +6,15 @@
 
 1. [Общая архитектура компонентов](#общая-архитектура-компонентов)
 2. [Поток обработки документа](#поток-обработки-документа)
-3. [Структура frontend](#структура-frontend-fsd-architecture)
-4. [Структура backend](#структура-backend-ddd-architecture)
-5. [Структура шины событий](#структура-шины-событий-kafka)
-6. [Структура воркеров](#структура-воркеров)
-7. [Структура хранилищ](#структура-хранилищ)
-8. [Структура системы оркестрации](#структура-системы-оркестрации)
+3. [Graceful Degradation и Resilience](#graceful-degradation-и-resilience)
+4. [Интеграционные точки Gateway](#интеграционные-точки-gateway-для-команды-it-правительства-москвы)
+5. [CI/CD и Delivery](#cicd-и-delivery)
+6. [Структура frontend](#структура-frontend-fsd-architecture)
+7. [Структура backend](#структура-backend-ddd-architecture)
+8. [Структура шины событий](#структура-шины-событий-kafka)
+9. [Структура воркеров](#структура-воркеров)
+10. [Структура хранилищ](#структура-хранилищ)
+11. [Структура системы оркестрации](#структура-системы-оркестрации)
 
 ---
 
@@ -632,6 +635,182 @@ sequenceDiagram
 | **Redis** | 3+ ноды для Sentinel/кластера, AOF `appendfsync everysec` |
 | **Мониторинг** | Prometheus + Grafana + OpenTelemetry |
 | **GPU** | Опционально для ускорения ML-воркеров (OCR, Voice) |
+
+---
+
+
+
+---
+
+## Graceful Degradation и Resilience
+
+Архитектура рассчитана на production-ready развёртывание, но в условиях ограниченных ресурсов и внешних зависимостей (ML через API, локальная инфраструктура) критично предусмотреть поведение при сбоях отдельных компонентов.
+
+### Kafka недоступна
+
+**Сценарий:** Kafka-кластер недоступен (сеть, перезапуск брокеров, деградация диска).
+
+**Поведение системы:**
+- **Outbox Relay** — при невозможности публикации событие остаётся в `outbox_events` со статусом `failed`, `last_error` записывает причину, `available_at` сдвигается на экспоненциальный backoff (5с → 10с → 20с → 60с). Relay продолжает polling — события не теряются.
+- **Gateway HTTP API** — `POST /tasks` продолжает работать: команда пишется в PostgreSQL + outbox, клиент получает `task_id`. Пайплайн просто отложен до восстановления Kafka. `GET /tasks/{id}` возвращает актуальный статус из PostgreSQL.
+- **Workers** — при недоступности Kafka consumer не может poll, под уходит в `CrashLoopBackOff` с `readinessProbe: false`. K8s оставляет 1 реплику живой (если Kafka временно недоступна — pod не паникует, а ждёт reconnect с exponential backoff в `confluent_kafka`).
+- **Saga / Notification Relay** — те же механизмы, что и у workers.
+
+**Fallback:** при длительном отсутствии Kafka (> 30 минут) — алерт в мониторинг, ручной рестарт брокеров или переключение на резервный брокер (если настроена multi-broker конфигурация).
+
+### OCR Worker: OOM или модель не загрузилась
+
+**Сценарий:** ML-модель (Tesseract/EasyOCR или внешний API) не загрузилась в память, произошёл OOMKill, или внешний API вернул 5xx.
+
+**Поведение системы:**
+- **OOMKill:** K8s `restartPolicy: OnFailure`, под пересоздаётся. `livenessProbe` с `initialDelaySeconds: 90` даёт время на загрузку модели. Если OOM повторяется 3 раза — под переходит в `CrashLoopBackOff`, задача в Kafka остаётся неподтверждённой (не ack), другой воркер (или тот же после фикса лимитов) заберёт её.
+- **Внешний API 5xx:** worker-core retry-декоратор делает 3 попытки с backoff 5с → 10с → 15с. Если неуспешно — публикация в `doc.ocr.dlq`, Saga вызывает `FailTaskUseCase`.
+- **Graceful fallback (опционально для демо):** если внешний OCR API недоступен, можно сконфигурировать fallback на второй провайдер (например, Google Vision → Azure Computer Vision) через `OCR_PROVIDER_FALLBACK` env-переменную. Это не меняет архитектуру — только адаптер в BL-сервисе.
+
+### PostgreSQL: read replica lag
+
+**Сценарий:** `GET /tasks/{id}` читает из read replica, которая отстаёт от primary на несколько секунд. Пользователь видит устаревший статус.
+
+**Поведение системы:**
+- **Критичные операции** (CreateTask, ConfirmUpload, FailTask) — всегда читают с primary (`SELECT ... FROM tasks WHERE id = ?` без routing к реплике).
+- **Аналитические запросы** (список задач, статистика) — допустимо читать с replica с лагом.
+- **Для демо:** если replica не настроена — все чтения идут с primary, лага нет. Read replicas — roadmap для масштабирования.
+
+### Redis недоступен
+
+**Сценарий:** Redis (кэш прогресса Saga, быстрый state) упал или недоступен.
+
+**Поведение системы:**
+- **Saga Orchestrator** — при записи в Redis получает ошибку, но продолжает работать с PostgreSQL (`task_processing_steps`). UI-прогресс может обновляться с задержкой (через polling `GET /tasks/{id}`), но бизнес-логика не ломается.
+- **Notification Relay** — WebSocket push'и продолжают работать (они от Kafka, не от Redis). Redis использовался только для кэширования последнего known state перед push'ем.
+- **При старте Saga-пода** — если Redis пуст, состояние восстанавливается из PostgreSQL (`SELECT task_id, step, status FROM task_processing_steps`).
+
+**Fallback:** Redis — опциональный компонент для демо. Можно запустить без него: Saga будет читать PostgreSQL напрямую, UI-прогресс через polling.
+
+### MinIO недоступен
+
+**Сценарий:** S3-совместимое хранилище (MinIO) недоступно при загрузке файла или чтении воркером.
+
+**Поведение системы:**
+- **Загрузка файла (Presigned URL)** — если MinIO вернул 5xx при генерации URL, Gateway возвращает `503 Service Unavailable` с `Retry-After: 10`. Клиент (frontend) retry'ит через 10 секунд.
+- **Чтение файла воркером** — при `GET` из MinIO получает 5xx/timeout. Worker-core retry делает 3 попытки. Если неуспешно — обработка падает, сообщение в DLQ, Saga инициирует компенсацию.
+- **Compensation Worker** — при удалении файлов из MinIO трактует `404 NoSuchKey` как успех (идемпотентность), но при 5xx — retry 3 раза, затем алерт (временные файлы остаются, не критично для бизнеса).
+
+### Timeout Scanner не запустился
+
+**Сценарий:** CronJob `timeout-scanner` не выполнился (K8s scheduler проблема, pod OOM).
+
+**Поведение системы:**
+- `concurrencyPolicy: Forbid` предотвращает параллельные запуски, но не защищает от пропуска тика.
+- **Fallback:** `task_processing_steps` продолжает накапливать `running`-шаги. При следующем успешном запуске Scanner'а — все «зависшие» шаги будут обнаружены и обработаны. Максимальная задержка компенсации = `schedule interval + timeout threshold` (например, 1 мин + 15 мин = 16 мин).
+- **Для критичных случаев:** Prometheus-алерт `task_processing_steps_stuck_count > 0` в течение 20 минут → ручное вмешательство.
+
+---
+
+## Интеграционные точки Gateway (для команды IT правительства Москвы)
+
+Gateway спроектирован как **единая точка входа** с чётким Anti-Corruption Layer (Transport Layer). Все внешние интеграции заказчика реализуются на этом слое без изменений в BL-сервисах, Kafka-топиках или worker'ах.
+
+### Адаптеры / Порты (готовые к реализации)
+
+```
+gateway/internal/transport/adapters/
+├── auth/
+│   ├── jwt_adapter.go              # текущая реализация (in-process)
+│   ├── esia_adapter.go             # [Интеграция] ЕСИА / Mos.ru
+│   └── mos_gov_adapter.go          # [Интеграция] Единая система идентификации
+├── document/
+│   ├── dwg_import_adapter.go       # [Интеграция] импорт DWG с слоями
+│   ├── pdf_layer_adapter.go        # [Интеграция] PDF с векторными слоями
+│   └── cad_export_adapter.go       # [Интеграция] экспорт в форматы САПР
+├── protocol/
+│   ├── pdf_export_adapter.go       # текущая реализация
+│   ├── xml_gis_adapter.go          # [Интеграция] ГИС / СМЭВ
+│   └── smev_adapter.go             # [Интеграция] портал госуслуг
+└── audit/
+    └── audit_log_adapter.go        # [Интеграция] аудит действий (152-ФЗ)
+```
+
+**Принцип:** каждый адаптер реализует интерфейс из `domain/ports/` и подменяется через dependency injection при старте Gateway. Текущая реализация — `jwt_adapter.go` + `pdf_export_adapter.go`. При интеграции с ЕСИА команда заказчика:
+
+1. Реализует `esia_adapter.go` (интерфейс уже определён в `domain/ports/auth.go`)
+2. Меняет `AUTH_PROVIDER=esia` в ConfigMap
+3. Пересобирает и redeploy'ит Gateway
+
+**BL-сервисы, Kafka, workers — не трогаются.**
+
+### Аудит и 152-ФЗ (roadmap)
+
+Для соответствия 152-ФЗ на уровне Gateway предусмотрены точки расширения:
+
+- **Audit Log Adapter** — перехватывает все `PATCH /discrepancies/{id}` (решения инспектора), `POST /tasks` (создание задач), `FailTaskUseCase` (сбои). Логирует: `who`, `what`, `when`, `before/after state`.
+- **Encryption at-rest** — PostgreSQL и MinIO шифруются на уровне инфраструктуры (LUKS для дисков, MinIO server-side encryption). Gateway не управляет шифрованием напрямую, но передаёт `tenant_id` для изоляции данных.
+- **Encryption in-transit** — mTLS между Gateway и PostgreSQL/MinIO/Kafka настраивается на уровне K8s (cert-manager + Istio/Linkerd). Gateway использует стандартные TLS-соединения.
+
+**Важно:** аудит и шифрование — зона ответственности команды IT правительства Москвы при доработке. Текущая архитектура предоставляет **порты (interfaces)**, не реализации.
+
+---
+
+## CI/CD и Delivery
+
+### Текущий pipeline (Gitea на личном сервере)
+
+```
+Developer push → Gitea (self-hosted)
+    ↓
+Gitea Actions / Drone CI
+    ↓
+Lint + Unit Tests (Go / Python)
+    ↓
+Docker Build (multi-stage)
+    ↓
+Docker Push → registry (self-hosted Harbor / Docker Registry)
+    ↓
+Helm Upgrade / kubectl apply (dev namespace)
+    ↓
+Smoke Tests (health endpoints)
+```
+
+**Репозитории:**
+- `doccontrol/gitea` — основной монорепозиторий (gateway, worker-core, services, frontend, infra)
+- `doccontrol/helm-charts` — Helm-чарты для K8s (опционально, можно держать в `infra/k8s/`)
+
+**Передача заказчику:**
+1. Форк репозитория на git.mos.ru (или аналогичную платформу правительства Москвы)
+2. Перенос CI/CD: Gitea Actions → GitLab CI / TeamCity (зависит от инфраструктуры заказчика)
+3. Docker Registry → внутренний registry заказчика
+4. K8s cluster → кластер заказчика (манифесты адаптируются под их network policies)
+
+**Что передаётся:**
+- Исходный код (Go + Python + TypeScript)
+- Dockerfiles и docker-compose.yml (для локального запуска)
+- K8s манифесты (Helm или raw YAML)
+- Документация (`docs/arch.md`, `docs/api-reference.md`)
+- **Не передаётся:** ML-модели (внешние API), инфраструктура Kafka/PostgreSQL/MinIO (разворачивается заказчиком)
+
+### Локальный запуск (для разработки и демо)
+
+```bash
+# Клонирование
+git clone https://gitea.selfhosted/doccontrol.git
+cd doccontrol
+
+# Инфраструктура
+docker-compose -f infra/docker-compose.yml up -d  # Kafka, PostgreSQL, MinIO, Redis
+
+# Gateway
+cd gateway && go run ./cmd/server
+
+# Workers (каждый в отдельном терминале)
+cd services/ocr-worker && python -m ocr_worker.main
+cd services/context-worker && python -m context_worker.main
+# ... и т.д.
+
+# Frontend
+cd frontend && npm run dev
+```
+
+**Для демо через месяц:** всё поднимается на одной машине через `docker-compose up`, без K8s. K8s-манифесты — roadmap для production-развёртывания командой заказчика.
 
 ---
 
